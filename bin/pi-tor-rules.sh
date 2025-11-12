@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # pi-tor-rules.sh
-# Idempotent helper that wires the usb gadget interface through the Tor
+# helper that wires the usb gadget interface through the Tor
 # transparent proxy (TransPort/DNSPort) exposed by the docker-compose stack.
 
 set -euo pipefail
