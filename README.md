@@ -40,6 +40,11 @@ console=serial0,115200 console=tty1 root=PARTUUID=4a85462b-02 rootfstype=ext4 fs
 ```
 And also...don't forget to enable ssh on the pi and add your keys
 
+### some snark
+it should look like this when your ready to go;
+![this thing](PXL_20251112_185810485.MP.jpg)
+
+
 ## Quick start
 
 1. Clone and enter the repo:
