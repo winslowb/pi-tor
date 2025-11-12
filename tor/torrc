@@ -14,7 +14,7 @@ SocksPolicy reject *
 TransPort 10.12.194.1:9040
 
 # DNS stays local-only (Pi-hole upstream or NAT redirect will use this)
-DNSPort 0.0.0.0:5353
+DNSPort 10.12.194.1:5353
 
 VirtualAddrNetworkIPv4 10.192.0.0/10
 AutomapHostsOnResolve 1

@@ -22,7 +22,7 @@ A minimal Docker stack for a USB-gadget Raspberry Pi that runs Pi-hole as the DN
 
 
 ## First things first
-Ensure you've updated both config.txt and cmdline.txt with the right stuff to make your raspberry pi zero work in gadget mode. (this shoudl actually work on a pi 4 or 5 as well) 
+Ensure you've updated both config.txt and cmdline.txt with the right stuff to make your raspberry pi zero work in gadget mode. (this should actually work on a pi 4 or 5 as well) 
 Also...lot's of stuff on the internet on how to do this correctly, but note Debian Trixie has made this a little less trivial than it once was. Also, there is a rpi-usb-gadget binary you can use from raspberry pi repo (it should turn 'it' on). Here is my stuff;
 
 ```
