@@ -1,9 +1,6 @@
 # pi-tor
 
-A minimal Docker stack for a USB-gadget Raspberry Pi that (1) runs Pi-hole as
-the DNS edge and (2) forwards every query through a locally hosted Tor daemon.
-Plug the Pi Zero into a laptop, share the `usb0` interface, and your DNS +
-TCP traffic is transparently proxied through Tor.
+A minimal Docker stack for a USB-gadget Raspberry Pi that runs Pi-hole as the DNS edge and forwards every query through a locally hosted Tor daemon. Plug the Pi Zero into a laptop, share the `usb0` interface, and your DNS + TCP traffic is transparently proxied through Tor.
 
 ## What you get
 
