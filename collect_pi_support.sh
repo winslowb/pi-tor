@@ -2,7 +2,8 @@
 # collect_pi_support.sh - Pi Zero (USB gadget) diagnostics bundle (verbose + fail-safe)
 set -Eeuo pipefail
 
-PROJECT_ROOT="${PROJECT_ROOT:-/home/bill/.docker/pi-tor-pihole}"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_ROOT="${PROJECT_ROOT:-${SCRIPT_DIR}}"
 OUT_DIR="${OUT_DIR:-${PROJECT_ROOT}/support}"
 BUNDLE_TAG="$(date -u +'%Y%m%dT%H%M%SZ')"
 TMP_DIR="$(mktemp -d "/tmp/pi-support.${BUNDLE_TAG}.XXXX")"
@@ -101,4 +102,3 @@ log "Packing bundle..."
 tar -C "${TMP_DIR}" -czf "${BUNDLE_PATH}" .
 log "PI SUPPORT BUNDLE: ${BUNDLE_PATH}"
 echo "${BUNDLE_PATH}"
-

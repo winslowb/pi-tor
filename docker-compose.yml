@@ -32,10 +32,10 @@ services:
     restart: unless-stopped
     depends_on: [tor]
     environment:
-      TZ: "UTC"
-      WEBPASSWORD: "g"              # change this
+      TZ: "${PI_TOR_TZ:-UTC}"
+      WEBPASSWORD: "${PIHOLE_WEBPASSWORD:-changeme}"
       DNSMASQ_LISTENING: "all"
-      DNS_QUERY_LOGGING: "false"
+      DNS_QUERY_LOGGING: "${PIHOLE_DNS_QUERY_LOGGING:-false}"
     volumes:
       - ./pihole/etc-pihole:/etc/pihole
       - ./pihole/etc-dnsmasq.d:/etc/dnsmasq.d
@@ -48,4 +48,3 @@ services:
     logging:
       driver: "json-file"
       options: { max-size: "5m", max-file: "2" }
-

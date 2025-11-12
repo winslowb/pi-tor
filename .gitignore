@@ -1,18 +1,19 @@
-*/config/development
-*/logs/log-*.php
-!*/logs/index.html
-*/cache/*
-!system/cache/*
-!*/cache/index.html
-!*/cache/.htaccess
+# Runtime volumes written by Pi-hole
+pihole/etc-pihole/*
+!pihole/etc-pihole/.gitkeep
 
-user_guide_src/build/*
-user_guide_src/cilexer/build/*
-user_guide_src/cilexer/dist/*
-user_guide_src/cilexer/pycilexer.egg-info/*
+# Tor persistent state (keys, circuits, cache)
+tor/tor-data/*
+!tor/tor-data/.gitkeep
 
-#codeigniter 3
-application/logs/*
-!application/logs/index.html
-!application/logs/.htaccess
-/vendor/
+# Support bundles and other diagnostics
+support/
+pi_support_*.tar.gz
+systemd/pi-tor.env
+
+# Local environment overrides / secrets
+.env
+
+# OS cruft
+.DS_Store
+Thumbs.db

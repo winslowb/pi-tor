@@ -5,7 +5,10 @@ Wants=network-online.target
 
 [Service]
 Type=oneshot
-ExecStart=/home/bill/.docker/pi-tor-pihole/bin/pi-tor-rules.sh
+Environment=PROJECT_DIR=/opt/pi-tor
+EnvironmentFile=-/etc/default/pi-tor
+ExecStart=${PROJECT_DIR}/bin/pi-tor-rules.sh apply
+ExecStop=${PROJECT_DIR}/bin/pi-tor-rules.sh flush
 RemainAfterExit=yes
 
 [Install]
