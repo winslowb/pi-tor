@@ -1,0 +1,22 @@
+#!/bin/bash 
+export USB=` ip -br link show|grep enx|awk '{print $1}'`
+export IF=` ip -br link show|grep enx|awk '{print $1}'`
+export WF=` ip -br link show|grep wlp3s0|awk '{print $1}'`
+sudo ip link set wlp3s0 up 
+
+# 1) undo all the routing stuff
+
+ sudo ip link set $USB down 
+ sudo ip route del default via 10.12.194.1
+ sudo ip addr flush dev $USB
+ sudo resolvectl flush-caches
+
+# 2) route out through your wifi and  and change named s'werver
+ sudo resolvectl dns wlp3s0 192.168.0.1 # change this to whatever your regular named server is
+ sudo ip route add default via 192.168.0.1
+ sudo resolvectl domain $USB "~."
+ sudo resolvectl dns $USB 192.168.0.1
+ host cnn.com
+ ping cnet.com -c 3
+
+ sudo ip -br a 

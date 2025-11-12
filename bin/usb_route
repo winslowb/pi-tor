@@ -1,0 +1,31 @@
+#!/bin/bash -x
+
+export USB=` ip -br link show|grep enx|awk '{print $1}'`
+export IF=` ip -br link show|grep enx|awk '{print $1}'`
+
+echo $USB; echo $IF
+
+sudo ip link set wlp3s0 down
+
+# 1) Put the USB link on the /24 
+sudo ip addr flush dev $USB
+sudo resolvectl flush-caches
+sudo ip addr add 10.12.194.2/24 dev $USB
+sudo ip link set $USB up
+
+# 2) Send all traffic through the Pi (keep Wi-Fi up as a fallback with higher metric if you want)
+sudo ip route replace default via 10.12.194.1 dev $USB metric 5
+
+# 3) Make systemd-resolved use Pi-hole for all lookups on that link
+sudo resolvectl dns $USB 10.12.194.1
+sudo resolvectl domain $USB "~."
+sudo resolvectl flush-caches
+
+# 4) Sanity checks
+ping -c2 10.12.194.1
+dig @10.12.194.1 example.com +short
+curl -4 https://api.ipify.org   # should now be a Tor exit IP
+
+
+CU=`curl -4 https://api.ipify.org`  
+curl https://ipinfo.io/$CU|jq 

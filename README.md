@@ -20,6 +20,26 @@ A minimal Docker stack for a USB-gadget Raspberry Pi that runs Pi-hole as the DN
 - A dedicated IPv4 gadget subnet (defaults to `10.12.194.0/24`)
 - `iptables-nft` (or legacy `iptables`)
 
+
+## First things first
+Ensure you've updated both config.txt and cmdline.txt with the right stuff to make your raspberry pi zero work in gadget mode. (this shoudl actually work on a pi 4 or 5 as well) 
+Also...lot's of stuff on the internet on how to do this correctly, but note Debian Trixie has made this a little less trivial than it once was. Also, there is a rpi-usb-gadget binary you can use from raspberry pi repo (it should turn 'it' on). Here is my stuff;
+
+```
+
+bill@raspberrypi:/boot $ tail firmware/config.txt 
+.... 
+[all]
+ enable_uart=1 #serial console stuff...ignore this
+dtoverlay=spi0-1cs #serial console stuff...ignore this too
+dtoverlay=dwc2,dr_mode=peripheral #THIS IS THE IMPORTANT...DO THIS
+
+bill@raspberrypi:/boot $ cat firmware/cmdline.txt 
+console=serial0,115200 console=tty1 root=PARTUUID=4a85462b-02 rootfstype=ext4 fsck.repair=yes rootwait quiet splash plymouth.ignore-serial-consoles
+
+```
+
+
 ## Quick start
 
 1. Clone and enter the repo:
