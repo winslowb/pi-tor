@@ -1,0 +1,12 @@
+[Unit]
+Description=Apply iptables rules for Pi Tor transparent proxy
+After=network-online.target docker.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/home/bill/.docker/pi-tor-pihole/bin/pi-tor-rules.sh
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target

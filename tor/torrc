@@ -1,0 +1,29 @@
+RunAsDaemon 0
+Log notice stdout
+AvoidDiskWrites 1
+
+# SOCKS: allow localhost (for healthcheck) and your USB subnet (for the workstation)
+SocksPort 127.0.0.1:9050
+SocksPort 10.12.194.1:9050
+SocksPolicy accept 127.0.0.1
+SocksPolicy accept 10.12.194.0/24
+SocksPolicy reject *
+
+# Transparent proxy: bind to loopback to avoid "public address" warning
+# (iptables REDIRECT delivers locally, so 127.0.0.1 is perfect)
+TransPort 10.12.194.1:9040
+
+# DNS stays local-only (Pi-hole upstream or NAT redirect will use this)
+DNSPort 0.0.0.0:5353
+
+VirtualAddrNetworkIPv4 10.192.0.0/10
+AutomapHostsOnResolve 1
+
+#StrictNodes 1
+#ExitNodes {us},{ca}
+#ExcludeNodes {ru},{cn}
+
+ExcludeExitNodes {ru},{cn},{ir},{kp}
+#ExitNodes {us},{ca},{gb},{nl},{se},{ch},{de}
+#StrictNodes 1
+

@@ -1,0 +1,51 @@
+services:
+  tor:
+    build: ./tor
+    image: torserver/tor:latest
+    container_name: tor
+    network_mode: "host"
+    restart: unless-stopped
+    volumes:
+      - ./tor/torrc:/etc/tor/torrc:ro
+      - ./tor/tor-data:/var/lib/tor
+    cap_add:
+      - NET_ADMIN
+    command: >
+      /bin/sh -c
+      "chmod 700 /var/lib/tor &&
+       chown -R debian-tor:debian-tor /var/lib/tor &&
+       exec /usr/bin/tor -f /etc/tor/torrc"
+    healthcheck:
+      test: ["CMD-SHELL", "sh -c 'tor-resolve example.com 127.0.0.1:9050 >/dev/null 2>&1'"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 60s
+    logging:
+      driver: "json-file"
+      options: { max-size: "5m", max-file: "2" }
+
+  pihole:
+    image: pihole/pihole:latest
+    container_name: pihole
+    network_mode: "host"
+    restart: unless-stopped
+    depends_on: [tor]
+    environment:
+      TZ: "UTC"
+      WEBPASSWORD: "g"              # change this
+      DNSMASQ_LISTENING: "all"
+      DNS_QUERY_LOGGING: "false"
+    volumes:
+      - ./pihole/etc-pihole:/etc/pihole
+      - ./pihole/etc-dnsmasq.d:/etc/dnsmasq.d
+    healthcheck:
+      test: ["CMD-SHELL", "bash -c '</dev/tcp/127.0.0.1/80' || exit 1"]
+      interval: 40s
+      timeout: 5s
+      retries: 3
+      start_period: 90s
+    logging:
+      driver: "json-file"
+      options: { max-size: "5m", max-file: "2" }
+

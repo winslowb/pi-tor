@@ -1,0 +1,15 @@
+[Unit]
+Description=pi-tor-pihole docker compose stack
+After=docker.service
+Requires=docker.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+WorkingDirectory=/home/bill/.docker/pi-tor-pihole
+ExecStart=/usr/bin/docker-compose up -d --build
+ExecStop=/usr/bin/docker-compose down
+TimeoutStartSec=300
+
+[Install]
+WantedBy=multi-user.target
