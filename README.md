@@ -38,7 +38,7 @@ bill@raspberrypi:/boot $ cat firmware/cmdline.txt
 console=serial0,115200 console=tty1 root=PARTUUID=4a85462b-02 rootfstype=ext4 fsck.repair=yes rootwait quiet splash plymouth.ignore-serial-consoles
 
 ```
-
+And also...don't forget to enable ssh on the pi and add your keys
 
 ## Quick start
 
@@ -110,14 +110,14 @@ Pi-hole dumps, Tor status, and networking info into `support/` for sharing.
 ## Repository layout
 
 ```
-docker-compose.yml        # Tor + Pi-hole stack
-pihole/etc-dnsmasq.d/     # Pi-hole dnsmasq overrides (tracked)
-pihole/etc-pihole/.gitkeep# bind mount placeholder (data ignored)
-tor/                      # Dockerfile + torrc + data dir placeholder
-bin/pi-tor-rules.sh       # iptables helper
-systemd/                  # optional unit files + env example
-collect_pi_support.sh     # diagnostics helper
+docker-compose.yml         # Tor + Pi-hole stack
+pihole/etc-dnsmasq.d/      # Pi-hole dnsmasq overrides (tracked)
+pihole/etc-pihole/.gitkeep # bind mount placeholder (data ignored)
+tor/                       # Dockerfile + torrc + data dir placeholder
+bin/pi-tor-rules.sh        # iptables helper
+systemd/                   # optional unit files + env example
+collect_pi_support.sh      # diagnostics helper
 ```
 
-Everything else (Pi-hole gravity DB, Tor keys, support bundles, .env) stays
-locally and is gitignored so the GitHub repo only contains what new users need.
+## Planned updates
+I'll add TailScale at some point.
