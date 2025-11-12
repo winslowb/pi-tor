@@ -30,12 +30,12 @@ Also...lot's of stuff on the internet on how to do this correctly, but note Debi
 bill@raspberrypi:/boot $ tail firmware/config.txt 
 .... 
 [all]
- enable_uart=1 #serial console stuff...ignore this
+enable_uart=1 #serial console stuff...ignore this
 dtoverlay=spi0-1cs #serial console stuff...ignore this too
-dtoverlay=dwc2,dr_mode=peripheral #THIS IS THE IMPORTANT...DO THIS
+dtoverlay=dwc2,dr_mode=peripheral #THIS IS THE IMPORTANT STUFF MAN...DO THIS
 
 bill@raspberrypi:/boot $ cat firmware/cmdline.txt 
-console=serial0,115200 console=tty1 root=PARTUUID=4a85462b-02 rootfstype=ext4 fsck.repair=yes rootwait quiet splash plymouth.ignore-serial-consoles
+console=serial0,115200 console=tty1 root=PARTUUID=4a85462b-02 rootfstype=ext4 fsck.repair=yes rootwait quiet splash plymouth.ignore-serial-consoles #THIS TOO...DO THIS
 
 ```
 And also...don't forget to enable ssh on the pi and add your keys
