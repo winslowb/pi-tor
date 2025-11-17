@@ -42,7 +42,7 @@ And also...don't forget to enable ssh on the pi and add your keys
 
 ### some snark
 it should look like this when your ready to go;
-![this thing](PXL_20251112_185810485.MP.jpg)
+![this thing](doc/PXL_20251112_185810485.MP.jpg)
 
 
 ## Quick start
