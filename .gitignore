@@ -17,6 +17,9 @@ systemd/pi-tor.env
 # Config UI backups (ui/apply.py)
 ui/backups/
 
+# Python bytecode
+__pycache__/
+
 # OS cruft
 .DS_Store
 Thumbs.db
