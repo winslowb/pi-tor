@@ -1,0 +1,124 @@
+/* pi-tor config UI — Gruvbox dark, system fonts only. */
+:root {
+  --bg: #282828;
+  --fg: #ebdbb2;
+  --accent: #df840c;
+  --muted: #928374;
+  --red: #fb4934;
+  --green: #b8bb26;
+  --card: #32302f;
+  --border: #504945;
+  --input: #3c3836;
+  --deep: #1d2021;
+}
+
+body {
+  background: var(--bg);
+  color: var(--fg);
+  font: 16px/1.5 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  margin: 0 auto;
+  max-width: 960px;
+  padding: 0 1rem 2rem;
+}
+
+header h1 {
+  border-bottom: 2px solid var(--accent);
+  padding-bottom: .5rem;
+}
+.accent { color: var(--accent); }
+
+h2 {
+  font-size: 1.1rem;
+  margin: 1.5rem 0 .5rem;
+  color: var(--fg);
+}
+
+.cards {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+  gap: .5rem;
+}
+.card {
+  background: var(--card);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: .6rem .9rem;
+}
+.card .k { color: var(--muted); font-size: .8rem; text-transform: uppercase; letter-spacing: .05em; }
+.card .v { margin-top: .2rem; font-size: 1.05rem; }
+.card.ok  .v { color: var(--green); }
+.card.bad .v { color: var(--red); }
+
+button {
+  background: var(--accent);
+  color: #282828;
+  border: 0;
+  border-radius: 4px;
+  padding: .5rem 1rem;
+  font-weight: 600;
+  cursor: pointer;
+}
+button.secondary { background: var(--input); color: var(--fg); }
+button.danger { background: var(--red); color: #282828; }
+
+.actions { margin: .8rem 0; display: flex; gap: .6rem; }
+.actions button { margin: 0; }
+
+form {
+  display: grid;
+  grid-template-columns: 1fr;
+  gap: .55rem;
+  max-width: 40rem;
+}
+label {
+  display: grid;
+  grid-template-columns: 12rem 1fr;
+  align-items: start;
+  gap: .75rem;
+}
+label .lbl { color: var(--fg); }
+label .hint { grid-column: 2; color: var(--muted); font-size: .78rem; }
+input, select {
+  background: var(--input);
+  color: var(--fg);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: .35rem .5rem;
+  width: 100%;
+  box-sizing: border-box;
+}
+input[type="password"] { font-family: monospace; }
+.field-error { color: var(--red); font-size: .85rem; }
+
+.errors { color: var(--red); margin: .5rem 0; }
+.ok-message { color: var(--green); }
+.muted { color: var(--muted); }
+
+pre {
+  background: var(--deep);
+  padding: .5rem;
+  border-radius: 4px;
+  overflow: auto;
+  max-height: 30rem;
+  white-space: pre-wrap;
+  word-break: break-word;
+  font-size: .85rem;
+}
+
+details {
+  background: var(--card);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  margin: .4rem 0;
+  padding: .5rem .8rem;
+}
+details summary { cursor: pointer; color: var(--accent); }
+details .diff-add { color: var(--green); }
+.diff { font-size: .85rem; }
+
+footer {
+  margin-top: 2rem;
+  border-top: 1px solid var(--border);
+  padding-top: .8rem;
+  font-size: .8rem;
+}
