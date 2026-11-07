@@ -14,6 +14,9 @@ systemd/pi-tor.env
 # Local environment overrides / secrets
 .env
 
+# Config UI backups (ui/apply.py)
+ui/backups/
+
 # OS cruft
 .DS_Store
 Thumbs.db

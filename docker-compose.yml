@@ -48,3 +48,29 @@ services:
     logging:
       driver: "json-file"
       options: { max-size: "5m", max-file: "2" }
+
+  ui:
+    build: ./ui
+    image: pi-tor-ui:latest
+    container_name: pi-tor-ui
+    network_mode: "host"
+    restart: unless-stopped
+    depends_on: [tor, pihole]
+    cap_add:
+      - NET_ADMIN
+      - NET_RAW
+    environment:
+      PI_TOR_UI_PASSWORD: "${PI_TOR_UI_PASSWORD:-changeme}"
+      PI_TOR_UI_PORT: "${PI_TOR_UI_PORT:-8080}"
+      PI_TOR_UI_DRY_RUN: "${PI_TOR_UI_DRY_RUN:-0}"
+      PI_TOR_PROJECT_DIR: "/project"
+    volumes:
+      - .:/project
+      # root-equivalent access on the host: see ui/README.md
+      - /var/run/docker.sock:/var/run/docker.sock
+      # host docker binary + cli-plugins for compose recreate operations
+      - /usr/bin/docker:/usr/bin/docker:ro
+      - /usr/libexec/docker/cli-plugins:/usr/libexec/docker/cli-plugins:ro
+    logging:
+      driver: "json-file"
+      options: { max-size: "5m", max-file: "2" }

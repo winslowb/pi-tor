@@ -10,6 +10,11 @@ A minimal Docker stack for a USB-gadget Raspberry Pi that runs Pi-hole as the DN
 - Idempotent iptables helper (`bin/pi-tor-rules.sh`) that turns the Pi into a
   transparent proxy for the gadget interface
 - Optional systemd units for auto-starting the stack and the firewall rules
+- A small configuration web UI (`ui/`) that renders every config file from
+  one validated schema, previews diffs, applies with backup + restart, and
+  can roll back — see [ui/README.md](ui/README.md). Note: the ui container
+  mounts the docker socket, which is root-equivalent on the host; the HTTP
+  Basic password is the only boundary in front of it.
 - A diagnostic bundle script (`collect_pi_support.sh`) for quick triage
 
 ## Requirements
