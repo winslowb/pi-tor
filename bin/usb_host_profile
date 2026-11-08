@@ -77,7 +77,7 @@ ADD_PL=(
   connection.autoconnect yes
   connection.autoconnect-priority 10
   ipv4.method manual "ipv4.addresses=$ADDR"
-  ipv4.never-default yes "ipv4.dns="
+  ipv4.never-default yes
 )
 DELETE_PL=(connection delete "$NAME")
 

@@ -35,7 +35,8 @@ PLAN_FRAGMENTS = (
     "ipv4.method manual",
     "ipv4.addresses=10.12.194.2/24",
     "ipv4.never-default yes",
-    "ipv4.dns=",
+    # DNS is left at NM's default (empty) by OMITTING the property: nmcli
+    # rejects a bare "ipv4.dns=" as "invalid property 'dns='".
     "would run: nmcli connection add type ethernet con-name pi-tor-gadget",
     "would run: nmcli connection up pi-tor-gadget",
 )
@@ -83,6 +84,14 @@ class HostProfileTest(unittest.TestCase):
         self.assertEqual(res.returncode, 0, res.stderr)
         for fragment in PLAN_FRAGMENTS:
             self.assertIn(fragment, res.stdout)
+        # No planned argument may carry an empty value: nmcli parses a bare
+        # "ipv4.dns=" as the property name "dns=" and aborts the whole
+        # connection add. This is the assertion that would have caught it.
+        for token in res.stdout.split():
+            self.assertFalse(
+                token.startswith(("ipv4.", "connection.", "match.")) and token.endswith("="),
+                f"empty-valued nmcli argument in the plan: {token!r}",
+            )
         self.assertNotIn("connection delete", res.stdout)
         case.assert_no_mutation(self)
         # the existence check is the only real (stubbed) call, and it is
