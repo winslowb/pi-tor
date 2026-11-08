@@ -13,10 +13,14 @@ write.
 ## Security, plainly
 
 **Mounting `/var/run/docker.sock` into the ui container is root-equivalent
-on the host.** The HTTP Basic password is the only boundary in front of it.
-There is no session, no IP filter, no rate limit beyond what the OS
-provides. Only run this UI on a network you control, and set a real
-`PI_TOR_UI_PASSWORD` in `.env`. Do not expose it through the tor proxy.
+on the host.** So is applying the firewall rules: the container holds
+`CAP_NET_ADMIN` on the host network namespace, and `bin/pi-tor-rules.sh`
+run inside it writes the **host's** nat/filter tables — same access as the
+socket, one shared implementation. The HTTP Basic password is the only
+boundary in front of either. There is no session, no IP filter, no rate
+limit beyond what the OS provides. Only run this UI on a network you
+control, and set a real `PI_TOR_UI_PASSWORD` in `.env`. Do not expose it
+through the tor proxy.
 
 ## Layout
 
@@ -40,8 +44,10 @@ provides. Only run this UI on a network you control, and set a real
 | `POST /api/preview` | `{values}` → per-file unified diff + errors; writes nothing. A changed `uplink_interface` missing on this host is an **error** (400); missing lease/default route is a **warning** (write not blocked); response carries `warnings` |
 | `POST /api/apply` | `{confirm: true, values}` — backup, write, restart only what changed, health poll 90 s; the report echoes uplink `warnings` |
 | `POST /api/rollback` | restore newest `ui/backups/<stamp>/` and restart |
+| `POST /api/rules/apply` | `{confirm: true}` — re-run `bin/pi-tor-rules.sh apply` against the current parsed config (the one the container runs at start); 400 on validation errors |
+| `POST /api/rules/flush` | `{confirm: true}` — remove the redirect: the recovery path |
 | `GET /api/logs?service=tor|pihole&lines=200` | container logs |
-| `GET /api/status` | dashboard JSON, incl. the read-only `uplink` panel |
+| `GET /api/status` | dashboard JSON, incl. the read-only `uplink` panel and the `rules` state shown in the dashboard card |
 
 Auth: HTTP Basic, user `pi-tor`, password from `PI_TOR_UI_PASSWORD`
 (`.env`), compared with `hmac.compare_digest`. Secrets never leave `/api/config`
@@ -81,6 +87,13 @@ restart-looping slowly, with the dashboard still explaining why tor is down.
 
 ## Apply semantics
 
+0. On container start the parsed config is validated and the rules are
+   applied (`bin/pi-tor-rules.sh apply`, idempotent) — before HTTP serving,
+   skipped silently in dry run and with a visible log line for an invalid
+   config. On a non-`nf_tables` `iptables -V` output the apply is refused
+   with a visible error: a legacy backend would edit a nat ruleset nothing
+   on the Pi reads. `docker compose up -d` is therefore the only bring-up
+   step; there is no systemd rules unit any more.
 1. Files that change are backed up to `ui/backups/<UTC-stamp>/` (relative
    paths preserved) with a `manifest.json` of originals + sha256.
 2. All seven render targets plus `.env`/`.env.example` are written
@@ -90,7 +103,15 @@ restart-looping slowly, with the dashboard still explaining why tor is down.
    `docker compose up -d --no-deps pihole` (recreate — a plain restart does
    not re-read env); rules keys changed (interface, subnet, gateway,
    trans/dns ports) → `bin/pi-tor-rules.sh apply` with explicit
-   `PI_TOR_*` env overrides (needs the container's CAP_NET_ADMIN).
+   `PI_TOR_*` env overrides (the container's CAP_NET_ADMIN writes the
+   host's tables). `/api/rules/apply` re-runs the same script on demand;
+   `/api/rules/flush` is its recovery counterpart — flush never needs the
+   redirect: HTTP to the Pi's own address stays alive because the chain's
+   RETURN rules keep traffic to the protected hosts out of the redirect,
+   which is the property that makes self-applied rules safe to ship. The
+   apply path also hard-refuses (script and schema) when `protected_hosts`
+   omits the gateway IP — that config would lock the operator out of SSH,
+   Pi-hole and this UI in one stroke.
 4. Health is polled for up to 90 s; a failed restart surfaces the last 50
    log lines and points at the Rollback button. **No auto-rollback.**
 5. `ui_port`/`ui_password` changes only take effect on the next
@@ -106,10 +127,12 @@ exercised on any machine with:
     docker run --rm -p 18080:8080 -e PI_TOR_UI_DRY_RUN=1 \
       -e PI_TOR_UI_PASSWORD=test -v "$PWD":/project pi-tor-ui:test
 
-Two deliberate exceptions keep working in dry run because they are
-strictly read-only: the uplink panel (`ip -j addr`, `ip -j route`,
-`iw dev <if> link`) and its submission checks. Nothing they run can
-change state.
+The startup rules apply and both `/api/rules/*` endpoints report
+`{"skipped": "dry-run"}` instead of touching iptables, and the version
+probe is skipped too. Two deliberate exceptions keep working in dry run
+because they are strictly read-only: the uplink panel (`ip -j addr`,
+`ip -j route`, `iw dev <if> link`) and its submission checks. Nothing they
+run can change state.
 
 ## Uplink panel & protected hosts
 
@@ -143,7 +166,8 @@ defaults.
   to a plain-HTTP IP echo service; if tor is not bootstrapped it reports
   *unavailable*.
 - The ui container must contain `iptables`/`iproute2` for the rules script
-  (installed in `Dockerfile`).
+  (installed in `Dockerfile`); only the nft backend is accepted, checked
+  via `iptables -V` before any apply.
 - `02-upstream-tor.conf` and `99-tor-upstream.conf` are near-duplicates;
   both are rendered as committed today (the UI does not consolidate them —
   that is a separate, explicit change).
