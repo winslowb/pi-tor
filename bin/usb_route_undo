@@ -73,8 +73,21 @@ if [ -d "$NET_DIR/$GADGET" ]; then
   # A bare resolvectl dns/domain on a link clears that link's setting.
   run_sudo resolvectl dns "$GADGET"
   run_sudo resolvectl domain "$GADGET"
-  run_sudo ip addr flush dev "$GADGET"
-  for addr in ${GADGET_PRE_ADDR:-}; do run_sudo ip addr add "$addr" dev "$GADGET"; done
+  # NetworkManager's pi-tor-gadget profile owns an address on this link and
+  # re-adds it instantly, so an unconditional flush+add races it and dies with
+  # "Address already assigned". Restore only what is genuinely missing, and
+  # flush only when the gadget had no address of its own before we touched it.
+  if [ -z "${GADGET_PRE_ADDR:-}" ]; then
+    run_sudo ip addr flush dev "$GADGET"
+  else
+    gadget_addrs="$(ip -4 addr show dev "$GADGET" 2>/dev/null || true)"
+    for addr in $GADGET_PRE_ADDR; do
+      case "$gadget_addrs" in
+      *"$addr"*) note "$addr already on $GADGET; leaving it" ;;
+      *)         run_sudo ip addr add "$addr" dev "$GADGET" ;;
+      esac
+    done
+  fi
   if [ "${GADGET_WAS_UP:-0}" = 0 ]; then run_sudo ip link set "$GADGET" down; fi
 else
   note "gadget interface $GADGET is gone: skipping its cleanup (route and DNS still restored)"
