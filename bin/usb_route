@@ -42,7 +42,7 @@ run_sudo() {
   if [ "$(id -u)" = 0 ]; then plan "$@"; else plan sudo "$@"; fi
 }
 
-default_route() { ip -4 route show default | head -n1; }
+default_route() { ip -4 route show default 2>/dev/null | sed -n '1p'; }
 # route_field LINE field: pull e.g. "dev"/"via"/"proto"/"metric" VALUE out of a route line
 route_field() { sed -n "s/.* $2 \([^ ]*\).*/\\1/p" <<<"$1"; }
 
@@ -55,10 +55,10 @@ require_resolved() {
 link_dns() {
   resolvectl dns "$1" >/dev/null 2>&1 ||
     die "resolvectl cannot reach systemd-resolved; is it running?"
-  resolvectl dns "$1" 2>/dev/null | sed 's/^[^)]*)[: ]*//' | head -n1
+  resolvectl dns "$1" 2>/dev/null | sed 's/^[^)]*)[: ]*//' | sed -n '1p'
 }
 link_domain() {
-  resolvectl domain "$1" 2>/dev/null | sed 's/^[^)]*)[: ]*//' | head -n1
+  resolvectl domain "$1" 2>/dev/null | sed 's/^[^)]*)[: ]*//' | sed -n '1p'
 }
 
 find_gadget() { # the enx*/usb* link; only disambiguated by subnet when several exist
@@ -156,7 +156,12 @@ echo "plan:"
 # Do NOT flush: NetworkManager's pi-tor-gadget profile owns this address and
 # re-adds it immediately, so a flush+add races it and `ip addr add` dies with
 # "Address already assigned". Assign only when it is genuinely missing.
-if ip -4 addr show dev "$GADGET" 2>/dev/null | grep -q "inet $GA/24"; then
+gadget_addrs="$(ip -4 addr show dev "$GADGET" 2>/dev/null || true)"
+case "$gadget_addrs" in
+*"inet $GA/24"*) gadget_has_addr=1 ;;   # no pipe: grep -q would SIGPIPE `ip` under pipefail
+*)               gadget_has_addr=0 ;;
+esac
+if [ "$gadget_has_addr" = 1 ]; then
   note "$GA/24 already on $GADGET (NetworkManager or a previous run); leaving it"
 else
   run_sudo ip link set "$GADGET" up

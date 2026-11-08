@@ -177,9 +177,14 @@ apply_rules() {
 
   if ip link show "$INTERFACE" >/dev/null 2>&1; then
     log "Publishing ${GATEWAY_IP} on ${INTERFACE}"
-    if ! ip addr show "$INTERFACE" | grep -q "$GATEWAY_IP"; then
-      ip addr add "${GATEWAY_CIDR}" dev "$INTERFACE"
-    fi
+    # capture first: `grep -q` closes the pipe early and SIGPIPEs `ip`, which
+    # under pipefail makes this test lie and re-add an address that is present
+    iface_addrs="$(ip addr show "$INTERFACE" 2>/dev/null || true)"
+    case "$iface_addrs" in
+    *"$GATEWAY_IP"*) : ;;
+    *)
+      ip addr add "${GATEWAY_CIDR}" dev "$INTERFACE" ;;
+    esac
   else
     log "Interface ${INTERFACE} is down; skipping address assignment"
   fi

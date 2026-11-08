@@ -38,7 +38,7 @@ run_sudo() {
   if [ "$(id -u)" = 0 ]; then plan "$@"; else plan sudo "$@"; fi
 }
 
-default_route() { ip -4 route show default | head -n1; }
+default_route() { ip -4 route show default 2>/dev/null | sed -n '1p'; }
 
 [ -f "$STATE_FILE" ] ||
   die "no saved tether state at $STATE_FILE: nothing to undo (bin/usb_route writes it when it routes)"
@@ -91,7 +91,7 @@ if [ "$MODE" = apply ]; then
   esac
   if [ -n "${PRIMARY_DNS:-}" ]; then
     first="${PRIMARY_DNS%% *}"
-    dns_now=$(resolvectl dns "$PRIMARY" 2>/dev/null | sed 's/^[^)]*)[: ]*//' | head -n1)
+    dns_now=$(resolvectl dns "$PRIMARY" 2>/dev/null | sed 's/^[^)]*)[: ]*//' | sed -n '1p')
     echo "dns on $PRIMARY: ${dns_now:-none}"
     case " $dns_now " in
       *" $first "*) ;;
