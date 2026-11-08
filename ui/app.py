@@ -202,6 +202,26 @@ class Handler(BaseHTTPRequestHandler):
             self._json(200 if report.get("ok") else 400, report)
         elif path == "/api/rollback":
             self._json(200, apply_mod.restore_latest_backup(ROOT))
+        elif path == "/api/rules/apply":
+            if body.get("confirm") is not True:
+                self._json(400, {"error": "rules apply requires confirm: true"})
+                return
+            values = render.read_current(ROOT)["values"]
+            errors = schema.validate(values)
+            if errors:
+                self._json(400, {"errors": errors})
+                return
+            self._json(200, dockerops.run_rules(ROOT, values))
+        elif path == "/api/rules/flush":
+            if body.get("confirm") is not True:
+                self._json(400, {"error": "rules flush requires confirm: true"})
+                return
+            # flush is the recovery path and needs no validation: it stays
+            # reachable over HTTP to the Pi's own address because the chain's
+            # RETURN rule keeps that traffic out of the redirect, and flush
+            # works whatever the current config says
+            values = render.read_current(ROOT)["values"]
+            self._json(200, dockerops.run_rules(ROOT, values, action="flush"))
         else:
             self._json(404, {"error": "not found"})
 
@@ -216,6 +236,15 @@ def main():
     dry = os.environ.get("PI_TOR_UI_DRY_RUN") == "1"
     sys.stderr.write(f"pi-tor-ui serving 0.0.0.0:{port} "
                      f"root={ROOT} dry_run={dry}\n")
+    if not dry:
+        # the ui container owns the firewall from here: apply on every start
+        # (idempotent), so a compose up is all the stack needs
+        try:
+            sys.stderr.write("pi-tor-ui startup rules: %s\n" % json.dumps(
+                apply_mod.startup_rules_apply(ROOT)))
+        except Exception as exc:  # noqa: BLE001 — serving must not wedge on it
+            sys.stderr.write("pi-tor-ui startup rules apply failed: "
+                             f"{type(exc).__name__}: {exc}\n")
     try:
         httpd.serve_forever()
     except KeyboardInterrupt:

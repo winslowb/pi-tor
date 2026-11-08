@@ -9,10 +9,15 @@ Apply:
    explicit env overrides),
 4. poll container health for 90s and surface logs of a failed restart.
 No auto-rollback: a visible failure beats a silent revert.
+
+The ui container also owns the firewall: on process start the parsed config
+is validated and bin/pi-tor-rules.sh apply runs (idempotent), so a compose
+up is the only step needed to bring the rules up.
 """
 import hashlib
 import json
 import os
+import sys
 from pathlib import Path
 
 import config_schema as schema
@@ -95,6 +100,29 @@ def _validated(cfg, current_values):
     errors = schema.validate(cfg)
     u_errors, u_warnings = uplink.submission(cfg, current_values)
     return errors + u_errors, u_warnings
+
+
+def startup_rules_apply(root, dry=None):
+    """Container-start firewall apply: skip in dry run, skip on an invalid
+    parsed config (with a visible line for both), then run the same script
+    the apply endpoint uses. Run_rules refuses a non-nf_tables backend."""
+    if dry is None:
+        dry = dockerops._dry()
+    if dry:
+        return {"skipped": "dry-run"}
+    values = render.read_current(root)["values"]
+    errors = schema.validate(values)
+    if errors:
+        summary = "; ".join(f"{e['key']}: {e['message']}" for e in errors)
+        sys.stderr.write(
+            "[pi-tor-ui] startup rules apply skipped: invalid config: "
+            f"{summary}\n")
+        return {"skipped": "invalid config", "errors": errors}
+    sys.stderr.write("[pi-tor-ui] applying firewall rules (bin/pi-tor-rules.sh apply)\n")
+    res = dockerops.run_rules(root, values)
+    if "error" in res:
+        sys.stderr.write(f"[pi-tor-ui] startup rules apply failed: {res['error']}\n")
+    return res
 
 
 def _restart_with_health(name, started=True):

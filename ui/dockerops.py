@@ -209,10 +209,20 @@ def rules_env(values):
     return {k: values[key] for k, key in RULES_ENV_KEYS.items()}
 
 
-def run_rules(root, values):
-    """Run bin/pi-tor-rules.sh apply with explicit PI_TOR_* env overrides."""
+def run_rules(root, values, action="apply"):
+    """Run bin/pi-tor-rules.sh apply|flush with explicit PI_TOR_* env overrides."""
     if _dry():
         return {"skipped": "dry-run"}
+    if action not in ("apply", "flush"):
+        return {"error": f"unknown rules action {action!r}"}
+    if action == "apply":
+        backend = iptables_backend()
+        if backend.get("backend") != "nf_tables":
+            return {"error": f"refusing to apply: the iptables backend is "
+                             f"{backend.get('backend') or 'unavailable'}, not "
+                             "nf_tables — a legacy ruleset would diverge from "
+                             "the host's",
+                    "backend": backend}
     script = os.path.join(str(root), "bin", "pi-tor-rules.sh")
     if not os.path.isfile(script):
         return {"error": f"{script} not found (project not mounted?)"}
@@ -220,14 +230,50 @@ def run_rules(root, values):
     env.update(rules_env(values))
     counters["subprocess_calls"] += 1
     try:
-        p = subprocess.run([script, "apply"], env=env,
+        p = subprocess.run([script, action], env=env,
                            capture_output=True, text=True, timeout=180)
     except Exception as exc:  # noqa: BLE001
         return {"error": f"pi-tor-rules.sh failed: {exc}"}
     if p.returncode != 0:
         return {"error": f"pi-tor-rules.sh exit {p.returncode}: "
                          f"{(p.stderr or p.stdout or '')[-1000:]}"}
-    return {"applied": True, "output": (p.stdout or "")[-2000:]}
+    return {"applied": True, "action": action, "output": (p.stdout or "")[-2000:]}
+
+
+def parse_backend(version_line):
+    """"iptables -V" output -> 'nf_tables' | 'legacy' | 'unknown'."""
+    if "(nf_tables)" in version_line:
+        return "nf_tables"
+    if "(legacy)" in version_line:
+        return "legacy"
+    return "unknown"
+
+
+def iptables_backend(version_output=None):
+    """Backend of the iptables binary the rules script would use (same
+    IPTABLES_BIN override and resolution order as the script). A legacy
+    binary would edit a nat ruleset nothing on the Pi reads — detect it,
+    never write through it."""
+    if _dry():
+        return {"backend": "skipped (dry-run)"}
+    binary = (os.environ.get("IPTABLES_BIN")
+              or shutil.which("iptables-nft") or shutil.which("iptables"))
+    if not binary:
+        return {"backend": "unknown",
+                "note": "no iptables binary in this container"}
+    if version_output is None:
+        counters["subprocess_calls"] += 1
+        try:
+            p = subprocess.run([binary, "-V"], capture_output=True,
+                               text=True, timeout=15)
+        except Exception as exc:  # noqa: BLE001
+            return {"backend": "unknown", "note": str(exc)}
+        version_output = (p.stdout or p.stderr).strip()
+        if p.returncode != 0:
+            return {"backend": "unknown", "version": version_output,
+                    "binary": binary}
+    return {"backend": parse_backend(version_output),
+            "version": version_output, "binary": binary}
 
 
 def iptables_status():

@@ -270,10 +270,32 @@ async function showLogs(service) {
   }
 }
 
+// ---------------- firewall rules ----------------
+
+async function rulesAction(action) {
+  if (!confirm(`Run bin/pi-tor-rules.sh ${action} on the host now?`)) return;
+  try {
+    const res = await api(`/api/rules/${action}`, {
+      method: "POST",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({confirm: true}),
+    });
+    const detail = res.skipped ? esc(res.skipped) :
+      res.error ? "FAILED — " + esc(res.error) :
+      action === "apply" ? "rules applied" : "rules flushed";
+    setStatus(`firewall ${action}: ${detail}`, !res.error);
+    await loadStatus();  // the firewall-rules card shows the resulting state
+  } catch (e) {
+    setStatus(`firewall ${action} failed: ${e.message}`);
+  }
+}
+
 // ---------------- wire up ----------------
 
 window.addEventListener("DOMContentLoaded", () => {
   $("refresh").onclick = loadStatus;
+  $("rules-apply").onclick = () => rulesAction("apply");
+  $("rules-flush").onclick = () => rulesAction("flush");
   $("preview").onclick = preview;
   $("apply").onclick = apply;
   $("rollback").onclick = rollback;
