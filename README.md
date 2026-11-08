@@ -11,7 +11,12 @@ A minimal Docker stack for a USB-gadget Raspberry Pi that runs Pi-hole as the DN
   transparent proxy for the gadget interface. `PI_TOR_PROTECTED_HOSTS`
   (default: the gateway IP) keeps traffic to the Pi itself out of the
   redirect, so SSH, Pi-hole and the config UI keep working; `show-rules`
-  prints the exact rule list without touching the firewall. The **ui
+  prints the exact nat **and filter** rule list, in apply order, without
+  touching the firewall. While applied, it also **drops non-DNS UDP** arriving
+  on the gadget interface (INPUT and FORWARD): TCP and DNS are redirected
+  into tor but UDP is not, so QUIC would go direct (unprotected) or hang —
+  the drop forces the TCP fallback that tor carries. This also kills mDNS
+  and any other UDP on the tether, which is intended. The **ui
   container applies the rules itself** — once when it starts (idempotent)
   and on demand from the dashboard — and refuses to apply a config whose
   protected hosts omit the gateway, because that would lock you out
@@ -31,6 +36,10 @@ A minimal Docker stack for a USB-gadget Raspberry Pi that runs Pi-hole as the DN
   can roll back — see [ui/README.md](ui/README.md). Note: the ui container
   mounts the docker socket, which is root-equivalent on the host; the HTTP
   Basic password is the only boundary in front of it.
+- A host-side tether UI (`hostui/`) that runs on the tethered **workstation**
+  (loopback only, stdlib, no build step): on/off toggle for the USB tether,
+  a live status panel, and a dead-man revert that restores the host's normal
+  routing when the Pi stops answering — see below
 - A diagnostic bundle script (`collect_pi_support.sh`) for quick triage
 
 ## Requirements
@@ -152,6 +161,93 @@ run of the rules themselves (e.g. flushing after a `compose down`),
 `bin/pi-tor-rules.sh apply|flush|show-rules` remains the single
 implementation — run it with `sudo` when the stack is not up.
 
+## Host tether UI (hostui/) — browser toggle + dead-man revert
+
+`hostui/` runs on the tethered **workstation**, not on the Pi: a stdlib-only
+`http.server` app (no dependencies, no build step, same Gruvbox look as the
+Pi's config UI) at `http://127.0.0.1:8090` with a status panel and one
+toggle. Toggling runs `bin/usb_route` / `bin/usb_route_undo` through
+`sudo -n` with a fixed argument list, and the UI keeps probing the Pi: if
+the Pi stops answering while the tether is up, the host is put back on its
+normal routing automatically (friendly dead-man, not a kill switch).
+
+```bash
+./hostui/app.py                    # or: python3 hostui/app.py
+# PI_TOR_HOSTUI_DRY_RUN=1 ./hostui/app.py       # never executes anything
+```
+
+### sudo setup (required for the toggle)
+
+The app never runs with root; it invokes `sudo -n <absolute script path>`.
+Without the rule the toggle reports exactly what is missing instead of a
+generic error. Permit **only** the two tether scripts for the user running
+the app, with the absolute paths of your checkout:
+
+```bash
+sudo tee /etc/sudoers.d/pi-tor-tether <<'EOF'
+bill ALL=(root) NOPASSWD: /home/bill/pi-tor/bin/usb_route, /home/bill/pi-tor/bin/usb_route_undo
+EOF
+sudo chmod 440 /etc/sudoers.d/pi-tor-tether && sudo visudo -c
+```
+
+Also make sure the two scripts are owned by root and not writable by group/
+others, so nothing can rewrite what sudo will execute.
+
+### Keep the dead-man alive (systemd --user + linger)
+
+The dead-man revert **only works while the UI process is running** — if the
+process dies while tethered, nothing reverts. Run it as a systemd user unit
+and enable linger (so it survives without you):
+
+```bash
+mkdir -p ~/.config/systemd/user && cp hostui/pi-tor-hostui.service \
+  ~/.config/systemd/user/pi-tor-hostui.service
+# adjust the ExecStart path if the repo is not at $HOME/pi-tor
+systemctl --user daemon-reload
+loginctl enable-linger "$USER"
+systemctl --user enable --now pi-tor-hostui.service
+```
+
+### Security notes
+
+- Loopback-only bind (`127.0.0.1:8090`); a non-loopback bind is refused at
+  startup unless `PI_TOR_HOSTUI_ALLOW_ANY=1` is set explicitly. Loopback
+  binds are still attacker-friendly if a malicious page can call
+  `http://127.0.0.1:8090`, which is why every mutating request must carry
+  the CSRF token the page issues (`X-PiTor-Token` header); a cross-origin
+  page can neither read it (same-origin policy) nor set it.
+- The app shells out only as `sudo -n <script>` with fixed argv (nothing
+  from request data reaches a shell). DNS in the status panel is read from
+  `resolvectl dns` (read-only, no sudo) with a resolv.conf fallback.
+- The app never writes outside the repo except the dead-man state file:
+  `$XDG_RUNTIME_DIR/pi-tor-hostui/dead-man.json` (or
+  `~/.cache/pi-tor-hostui/dead-man.json`), overridable with
+  `PI_TOR_HOSTUI_STATE`. The tether history is in memory (bounded tail at
+  `/api/log`).
+- `PI_TOR_HOSTUI_DRY_RUN=1` makes the toggle report what it would run
+  without executing anything.
+
+### Knobs
+
+| var | default | meaning |
+|---|---|---|
+| `PI_TOR_HOSTUI_PORT` | `8090` | listen port |
+| `PI_TOR_HOSTUI_BIND` | `127.0.0.1` | bind address (loopback enforced) |
+| `PI_TOR_HOSTUI_ALLOW_ANY` | unset | `1` allows a non-loopback bind |
+| `PI_TOR_HOSTUI_DRY_RUN` | unset | `1` disables all script execution |
+| `PI_TOR_HOSTUI_STATE` | runtime dir (above) | dead-man state file |
+| `PI_TOR_PI_ADDR` | `10.12.194.1` | the Pi side of the gadget link |
+| `PI_TOR_UI_PORT` | `8080` | Pi config-UI port the dead-man probes |
+| `PI_TOR_PROBE_INTERVAL` | `15` | probe cadence in seconds |
+| `PI_TOR_REVERT_AFTER` | `90` | seconds of consecutive failures before auto-revert |
+
+The dead-man probes the Pi's config-UI port with a TCP connect (ICMP is not
+redirected, so ping alone would be misleading), fires `bin/usb_route_undo`
+**once** per tether session after `PI_TOR_REVERT_AFTER` seconds of
+consecutive failures, logs the reason, and then stops probing until you
+re-enable the tether. State survives a UI restart (the session is re-armed
+from the state file); it does not survive a process that is down.
+
 ## Diagnostics
 
 Run `./collect_pi_support.sh` to capture system state, docker details,
@@ -167,6 +263,8 @@ tor/                       # Dockerfile + torrc + data dir placeholder
 bin/pi-tor-rules.sh        # iptables helper (apply|flush|show-rules),
                            # executed by the ui container, sudo for manual runs
 bin/uplink-check.sh        # tor-side uplink gate (IPv4 lease + default route)
+bin/usb_route[, _undo]     # host-side tether toggle + saved-state undo
+hostui/                    # host tether UI: app.py + pi-tor-hostui.service
 systemd/                   # optional stack unit + env example
 collect_pi_support.sh      # diagnostics helper
 ```
