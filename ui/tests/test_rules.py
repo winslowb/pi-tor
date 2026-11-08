@@ -2,10 +2,11 @@
 the env plumbing from the schema into the rules script."""
 import os
 import re
+import shutil
 import subprocess
 import unittest
 
-from helpers import REPO
+from helpers import REPO, make_config_tree
 
 import apply as apply_mod
 import config_schema as schema
@@ -107,6 +108,56 @@ class ProtectedHostParseTest(unittest.TestCase):
         cfg2 = dict(schema.defaults(), protected_hosts="10.12.194.9")
         self.assertEqual(dockerops.rules_env(cfg2)["PI_TOR_PROTECTED_HOSTS"],
                          "10.12.194.9")
+
+
+class LockoutGuardTest(unittest.TestCase):
+    """Gateway IP missing from protected hosts = operator lockout: the
+    script refuses before any iptables call, the schema refuses the whole
+    apply, and the empty-list fallback stays legal."""
+
+    def _apply(self, protected):
+        env = dict(os.environ)
+        env.update({"PI_TOR_FAKE_ROOT": "1",
+                    # guard must fire before any iptables binary is touched
+                    "IPTABLES_BIN": "/nonexistent/iptables-stub-must-not-run",
+                    "PI_TOR_PROTECTED_HOSTS": protected})
+        return subprocess.run(["bash", str(RULES), "apply"],
+                              capture_output=True, text=True, env=env,
+                              timeout=30)
+
+    def test_apply_refused_when_gateway_not_protected(self):
+        p = self._apply("10.12.194.9")
+        self.assertNotEqual(p.returncode, 0)
+        self.assertIn("refusing to apply", p.stderr)
+        self.assertIn("lock you out", p.stderr)
+
+        # schema level: a hard error, not a warning
+        cfg = dict(schema.defaults(), protected_hosts="10.12.194.9")
+        errors = schema.validate(cfg)
+        msg = " ".join(e["message"] for e in errors
+                       if e["key"] == "protected_hosts")
+        self.assertIn("lock you out", msg)
+        self.assertIn("10.12.194.1", msg)
+
+        # the guarded default still validates
+        self.assertEqual(schema.validate(schema.defaults()), [])
+
+        # and apply_changes refuses before writing or restarting anything
+        tree = make_config_tree()
+        try:
+            report = apply_mod.apply_changes(
+                tree, {"protected_hosts": "10.12.194.9"})
+            self.assertFalse(report["ok"])
+            self.assertIn("lock you out",
+                          " ".join(e["message"] for e in report["errors"]))
+        finally:
+            shutil.rmtree(tree, ignore_errors=True)
+
+    def test_empty_protected_list_still_falls_back(self):
+        # empty means "gateway" in the script, so the schema must not
+        # reject an empty list (the guard only fires on an explicit list)
+        cfg = dict(schema.defaults(), protected_hosts="")
+        self.assertEqual(schema.validate(cfg), [])
 
 
 if __name__ == "__main__":

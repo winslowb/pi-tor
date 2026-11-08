@@ -154,13 +154,17 @@ def validate(values):
         err("uplink_interface",
             "interface name must match [a-zA-Z0-9_.:-] and be 1-15 characters")
 
+    protected = []
+    bad_protected = False
     for host in [t for t in re.split(r"[,\s]+", v["protected_hosts"].strip())
                  if t]:
         try:
             addr = ipaddress.ip_address(host)
             if addr.version != 4:
                 raise ValueError
+            protected.append(str(addr))
         except ValueError:
+            bad_protected = True
             err("protected_hosts", f"'{host}' must be an IPv4 address")
 
     nets = {}
@@ -182,8 +186,19 @@ def validate(values):
         if "subnet" in nets and gw not in nets["subnet"]:
             err("gateway_ip",
                 f"{gw} must lie inside subnet {v['subnet']}")
+        gw_ok = True
     except ValueError:
         err("gateway_ip", "must be a valid IPv4 address like 10.12.194.1")
+        gw_ok = False
+
+    # Empty protected_hosts falls back to the gateway in the script; an
+    # explicit list without the gateway would redirect the Pi's own traffic
+    # and lock the operator out — refuse it outright.
+    if protected and not bad_protected and gw_ok and v["gateway_ip"] not in protected:
+        err("protected_hosts",
+            f"the gateway {v['gateway_ip']} must be listed in protected_hosts — "
+            "applying the firewall rules without it would lock you out of "
+            "SSH, Pi-hole and this UI")
 
     ports = {}
     for key in TOR_PORTS + ("ui_port",):

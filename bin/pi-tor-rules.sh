@@ -76,10 +76,25 @@ IPTABLES_BIN="${IPTABLES_BIN:-}"
 log() { printf '[pi-tor] %s\n' "$*"; }
 
 require_root() {
-  if [[ $EUID -ne 0 ]]; then
+  # PI_TOR_FAKE_ROOT=1 is a test-suite hook, used only together with a stub
+  # IPTABLES_BIN that simulates a ruleset in a temp dir; it can never touch
+  # a real ruleset because the binary it pairs with is not iptables.
+  if [[ $EUID -ne 0 && "${PI_TOR_FAKE_ROOT:-}" != "1" ]]; then
     echo "This script must run as root (sudo pi-tor-rules.sh ${ACTION})." >&2
     exit 1
   fi
+}
+
+# Applying without the gateway in the protected list redirects the Pi's own
+# traffic into tor and locks the operator out of SSH, Pi-hole and this UI
+# — including the UI flush endpoint that would undo it.
+refuse_unprotected_gateway() {
+  local h
+  for h in "${PROTECTED_ARR[@]}"; do
+    [[ "$h" == "$GATEWAY_IP" ]] && return 0
+  done
+  echo "[pi-tor] refusing to apply: $GATEWAY_IP is missing from PI_TOR_PROTECTED_HOSTS (${PROTECTED_HOSTS}); applying would redirect the Pi's own traffic into tor and lock you out of SSH, Pi-hole and this UI" >&2
+  exit 64
 }
 
 add_rule_if_missing() {
@@ -98,9 +113,11 @@ delete_rule_if_present() {
 
 apply_rules() {
   require_root
-  log "Enabling IPv4 forwarding"
-  sysctl -w net.ipv4.ip_forward=1 >/dev/null
-  sysctl -w "net.ipv4.conf.${INTERFACE}.rp_filter=0" >/dev/null 2>&1 || true
+  # No sysctl writes here: this script now runs inside the ui container on
+  # the host's network namespace, where sysctl -w cannot touch the host's
+  # tunables anyway. And none of them are needed: a nat PREROUTING REDIRECT
+  # makes the packet local on the Pi itself (nothing is forwarded, so
+  # ip_forward is irrelevant; ICMP is not redirected at all).
 
   log "Configuring NAT redirect chain (${CHAIN})"
   if ! "$IPTABLES_BIN" -t nat -L "$CHAIN" >/dev/null 2>&1; then
@@ -149,6 +166,7 @@ flush_rules() {
 case "$ACTION" in
   apply)
     validate_protected_hosts
+    refuse_unprotected_gateway
     [[ -n "$IPTABLES_BIN" ]] || IPTABLES_BIN="$(resolve_iptables)"
     apply_rules
     ;;

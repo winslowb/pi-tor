@@ -57,6 +57,9 @@ class RenderDefaultsTest(unittest.TestCase):
         cfg = dict(schema.defaults())
         cfg["subnet"] = "10.44.0.0/24"
         cfg["gateway_ip"] = "10.44.0.1"
+        # a gateway move must carry its protected host with it (the
+        # unprotected-gateway guard would refuse the config below)
+        cfg["protected_hosts"] = "10.44.0.1"
         self.assertEqual(schema.validate(cfg), [])
         rendered = render.render(cfg)
 
@@ -79,7 +82,7 @@ class RenderDefaultsTest(unittest.TestCase):
             "PI_TOR_GATEWAY": "10.44.0.1",
             "PI_TOR_TRANS_PORT": "9040",
             "PI_TOR_DNS_PORT": "5353",
-            "PI_TOR_PROTECTED_HOSTS": "10.12.194.1",
+            "PI_TOR_PROTECTED_HOSTS": "10.44.0.1",
         })
 
         # parser round trip from a written tree

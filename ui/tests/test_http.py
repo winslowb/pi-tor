@@ -77,7 +77,8 @@ class PreviewTest(HttpTestBase):
     def test_preview_writes_nothing(self):
         before = tree_fingerprint(self.tree)
         code, _, body = self.client.json("POST", "/api/preview", body={
-            "values": {"subnet": "10.55.0.0/24", "gateway_ip": "10.55.0.1"}})
+            "values": {"subnet": "10.55.0.0/24", "gateway_ip": "10.55.0.1",
+                       "protected_hosts": "10.55.0.1"}})
         self.assertEqual(code, 200)
         changed = {rel for rel, d in body["diffs"].items() if d}
         self.assertIn("tor/torrc", changed)
@@ -186,6 +187,39 @@ class DryRunTest(HttpTestBase):
         self.assertEqual(dockerops.counters,
                          {"socket_calls": 0, "subprocess_calls": 0},
                          "dry run touched the docker socket / subprocesses")
+
+
+class RulesEndpointsTest(HttpTestBase):
+
+    def test_dry_run_never_invokes_iptables(self):
+        import apply as apply_mod
+        dockerops.counters.update({"socket_calls": 0, "subprocess_calls": 0})
+
+        def _deny(*popenargs, **kwargs):
+            argv = popenargs[0] if popenargs else (kwargs.get("args") or [])
+            raise AssertionError(f"subprocess during dry run: {argv!r}")
+
+        with mock.patch.object(dockerops.subprocess, "run", new=_deny):
+            code, _, body = self.client.json(
+                "POST", "/api/rules/apply", body={"confirm": True})
+            self.assertEqual(code, 200, body)
+            self.assertEqual(body, {"skipped": "dry-run"})
+            code, _, body = self.client.json(
+                "POST", "/api/rules/flush", body={"confirm": True})
+            self.assertEqual(code, 200, body)
+            self.assertEqual(body, {"skipped": "dry-run"})
+            # and startup apply is skipped the same way
+            self.assertEqual(apply_mod.startup_rules_apply(app.ROOT),
+                             {"skipped": "dry-run"})
+        self.assertEqual(dockerops.counters["subprocess_calls"], 0)
+
+    def test_rules_endpoints_require_confirm_and_validate(self):
+        code, _, body = self.client.json("POST", "/api/rules/apply", body={})
+        self.assertEqual(code, 400)
+        self.assertIn("confirm", body["error"])
+        code, _, body = self.client.json("POST", "/api/rules/flush", body={})
+        self.assertEqual(code, 400)
+        self.assertIn("confirm", body["error"])
 
 
 if __name__ == "__main__":
