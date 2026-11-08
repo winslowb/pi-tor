@@ -1,0 +1,26 @@
+# pi-tor host tether UI — user unit for the tethered workstation.
+#
+# Install (see README "Host tether UI (hostui/)"):
+#   mkdir -p ~/.config/systemd/user
+#   cp hostui/pi-tor-hostui.service ~/.config/systemd/user/
+#   # adjust ExecStart if the repo is not at %h/pi-tor
+#   systemctl --user daemon-reload
+#   loginctl enable-linger "$USER"   # keeps the dead-man alive after logout
+#   systemctl --user enable --now pi-tor-hostui
+#
+# The dead-man revert only works while this process is running: if the process
+# dies while tethered, nothing reverts. Linger keeps it alive without you.
+
+[Unit]
+Description=pi-tor host tether UI (loopback toggle + dead-man revert)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+ExecStart=/usr/bin/python3 %h/pi-tor/hostui/app.py
+Environment=PI_TOR_HOSTUI_PORT=8090
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target
