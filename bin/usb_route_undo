@@ -5,7 +5,17 @@
 # --dry-run prints the plan. Refuses to invent anything when state is missing.
 set -euo pipefail
 
-STATE_DIR="${PI_TOR_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/pi-tor}"
+# Under `sudo -n <script>` HOME is /root, which would put the tether snapshot
+# in root's home and leave the user's undo looking at a different file. When
+# sudo tells us who invoked us, use that user's state dir (both scripts run
+# the same way, so they agree).
+if [ -n "${PI_TOR_STATE_DIR:-}" ]; then
+  STATE_DIR="$PI_TOR_STATE_DIR"
+elif [ -n "${SUDO_USER:-}" ] && [ "$SUDO_USER" != root ]; then
+  STATE_DIR="$(getent passwd "$SUDO_USER" | cut -d: -f6)/.local/state/pi-tor"
+else
+  STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/pi-tor"
+fi
 STATE_FILE="$STATE_DIR/tether.conf"
 NET_DIR="${PI_TOR_NET_DIR:-/sys/class/net}" # PI_TOR_NET_DIR is a test seam
 
