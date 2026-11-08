@@ -998,7 +998,11 @@ TETHER_SCRIPT = """\
   $("refresh").onclick = loadAll;
   $("toggle").onclick = function () {
     var btn = $("toggle");
-    var on = current === "on";
+    // The toggle applies the OPPOSITE of the current state. Getting this
+    // backwards is invisible in tests that only look for the button: clicking
+    // re-ran the same direction forever (off -> undo -> "no saved tether
+    // state"), so the tether could never be turned on from the page.
+    var on = current !== "on";
     btn.disabled = true; btn.textContent = "…";
     fetch("/api/tether", { method: "POST",
       headers: { "Content-Type": "application/json",

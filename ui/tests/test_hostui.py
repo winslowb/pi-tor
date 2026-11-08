@@ -5,6 +5,8 @@ usb_route_undo are never executed (the one-time live pass is Karl's)."""
 import os
 import re
 import unittest
+
+from helpers import REPO
 from unittest import mock
 
 from hostui_helpers import BootedTest, hostui_app, make_cfg, req, req_raw
@@ -146,6 +148,20 @@ class HostUiHttpTest(BootedTest):
                          {"iface": "usb0", "gateway": "10.12.194.1"})
         self.assertEqual(
             hostui_app.default_route(str(self.tmp / "route-none")), None)
+
+
+
+    def test_toggle_payload_is_the_opposite_of_current_state(self):
+        """A toggle that sends its own current state is a no-op.
+
+        This shipped once: `on = current === "on"` meant clicking while off
+        posted {on: false}, so the page could never enable the tether and every
+        click produced "no saved tether state" from undo. Assert the direction,
+        not merely that a button exists.
+        """
+        src = (REPO / "hostui" / "app.py").read_text()
+        self.assertIn('var on = current !== "on"', src)
+        self.assertNotIn('var on = current === "on"', src)
 
 
 if __name__ == "__main__":
