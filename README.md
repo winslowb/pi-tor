@@ -174,16 +174,63 @@ implementation — run it with `sudo` when the stack is not up.
 
 `hostui/` runs on the tethered **workstation**, not on the Pi: a stdlib-only
 `http.server` app (no dependencies, no build step, same Gruvbox look as the
-Pi's config UI) at `http://127.0.0.1:8090` with a status panel and one
-toggle. Toggling runs `bin/usb_route` / `bin/usb_route_undo` through
-`sudo -n` with a fixed argument list, and the UI keeps probing the Pi: if
-the Pi stops answering while the tether is up, the host is put back on its
-normal routing automatically (friendly dead-man, not a kill switch).
+Pi's config UI) at `http://127.0.0.1:8090` with two tabs. The default
+**Tether** tab is just the toggle, the status, and the log: one control, one
+green/red status row per check (each row states what it means in words, never
+colour alone), and the connection log. Toggling runs `bin/usb_route` /
+`bin/usb_route_undo` through `sudo -n` with a fixed argument list, and the UI
+keeps probing the Pi: if the Pi stops answering while the tether is up, the
+host is put back on its normal routing automatically (friendly dead-man, not
+a kill switch). The **Config** tab (`/config`) holds the six knobs and the
+read-only diagnostics.
 
 ```bash
 ./hostui/app.py                    # or: python3 hostui/app.py
 # PI_TOR_HOSTUI_DRY_RUN=1 ./hostui/app.py       # never executes anything
 ```
+
+### The Tether tab: status rows and the connection log
+
+The status is one row per check: **gadget link** (interface holding
+`host_addr` and its carrier), **Pi reachable** (TCP probe to
+`pi_addr:pi_ui_port`), **tether active** (default route via the Pi), **DNS
+through the Pi** (a real A query answered by `pi_addr:53`), **tor exit** (the
+observed exit IP differing from the direct WAN IP recorded while untethered)
+and **dead-man** (armed/idle plus the seconds left in the revert window).
+Each red row states *why* ("Pi stopped answering 3 probe(s)"), and rows that
+do not apply just say idle — tether off means normal DNS is expected, not a
+failure. The page polls every 2 s while visible and states plainly that ping
+(ICMP) does not work while tethered.
+
+The connection log is an append-only event file next to the dead-man state
+(`events.log`, bounded to the last 500 lines), served newest-first from
+`GET /api/log` (last 200 entries). It records every toggle with the argv, a
+refused toggle with the reason, each dead-man probe transition (window start
+and recovery, not every 15 s tap), the auto-revert with its consecutive
+failure count, and each exit-IP / direct-WAN observation with the IP.
+
+### The Config tab
+
+Six knobs, validated per field (an invalid form saves nothing), persisted to
+`$XDG_CONFIG_HOME/pi-tor-hostui/config.json` (fallback `~/.config/…`,
+override `PI_TOR_HOSTUI_CONFIG`); values saved there take precedence over
+the `PI_TOR_*` environment on the next start. A valid save applies to the
+running probe loop immediately — the loop re-reads its config every cycle,
+no restart, and an armed dead-man is never disarmed by saving. Every change
+is logged on the Tether tab's connection log. The page also shows read-only
+diagnostics — the `nmcli` profile `pi-tor-gadget`, whether
+`/etc/sudoers.d/pi-tor-tether` exists, and the live `ip route`/DNS state —
+so a misconfiguration is visible instead of inferred; under dry run those
+commands are skipped.
+
+| key | meaning | default |
+|---|---|---|
+| `pi_addr` | the Pi's tether address | `10.12.194.1` |
+| `host_addr` | the host's tether address | `10.12.194.2` |
+| `pi_ui_port` | port used for the reachability probe | `8080` |
+| `probe_interval` | seconds between dead-man probes (1–600) | `15` |
+| `revert_after` | seconds of consecutive failures before revert (10–3600) | `90` |
+| `listen_port` | the UI's own port (**applies on restart**) | `8090` |
 
 ### sudo setup (required for the toggle)
 
@@ -222,19 +269,23 @@ systemctl --user enable --now pi-tor-hostui.service
 - Loopback-only bind (`127.0.0.1:8090`); a non-loopback bind is refused at
   startup unless `PI_TOR_HOSTUI_ALLOW_ANY=1` is set explicitly. Loopback
   binds are still attacker-friendly if a malicious page can call
-  `http://127.0.0.1:8090`, which is why every mutating request must carry
-  the CSRF token the page issues (`X-PiTor-Token` header); a cross-origin
-  page can neither read it (same-origin policy) nor set it.
+  `http://127.0.0.1:8090`, which is why every mutating request must both
+  carry the CSRF token the page issues (`X-PiTor-Token` header) and — when
+  it sends an `Origin` at all — be same-origin; a cross-origin page can
+  neither read the token (same-origin policy) nor fake the Origin check.
 - The app shells out only as `sudo -n <script>` with fixed argv (nothing
   from request data reaches a shell). DNS in the status panel is read from
   `resolvectl dns` (read-only, no sudo) with a resolv.conf fallback.
-- The app never writes outside the repo except the dead-man state file:
-  `$XDG_RUNTIME_DIR/pi-tor-hostui/dead-man.json` (or
-  `~/.cache/pi-tor-hostui/dead-man.json`), overridable with
-  `PI_TOR_HOSTUI_STATE`. The tether history is in memory (bounded tail at
-  `/api/log`).
-- `PI_TOR_HOSTUI_DRY_RUN=1` makes the toggle report what it would run
-  without executing anything.
+- The app never writes outside the repo except its runtime files: the
+  dead-man state file (`$XDG_RUNTIME_DIR/pi-tor-hostui/dead-man.json` or
+  `~/.cache/…`, override `PI_TOR_HOSTUI_STATE`), the bounded event log next
+  to it (`events.log`, override `PI_TOR_HOSTUI_LOG`), and the config file
+  the Config tab saves (`$XDG_CONFIG_HOME/pi-tor-hostui/config.json`,
+  override `PI_TOR_HOSTUI_CONFIG`).
+- `PI_TOR_HOSTUI_DRY_RUN=1` executes nothing: the toggle and revert report
+  what they would run, the Config-tab diagnostics (nmcli/ip/resolvectl) are
+  skipped, and the exit-IP lookups are skipped too — only read-only probes
+  of the Pi (TCP, DNS) may run.
 
 ### Knobs
 
@@ -245,7 +296,10 @@ systemctl --user enable --now pi-tor-hostui.service
 | `PI_TOR_HOSTUI_ALLOW_ANY` | unset | `1` allows a non-loopback bind |
 | `PI_TOR_HOSTUI_DRY_RUN` | unset | `1` disables all script execution |
 | `PI_TOR_HOSTUI_STATE` | runtime dir (above) | dead-man state file |
+| `PI_TOR_HOSTUI_LOG` | next to the state file | bounded event log (`/api/log`) |
+| `PI_TOR_HOSTUI_CONFIG` | `~/.config/pi-tor-hostui/config.json` | the Config tab's saved values |
 | `PI_TOR_PI_ADDR` | `10.12.194.1` | the Pi side of the gadget link |
+| `PI_TOR_HOST_ADDR` | `10.12.194.2` | this host's address on the gadget link |
 | `PI_TOR_UI_PORT` | `8080` | Pi config-UI port the dead-man probes |
 | `PI_TOR_PROBE_INTERVAL` | `15` | probe cadence in seconds |
 | `PI_TOR_REVERT_AFTER` | `90` | seconds of consecutive failures before auto-revert |
