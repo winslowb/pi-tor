@@ -18,6 +18,13 @@ FIELDS = {
         "default": "usb0",
         "targets": "02-usb0.conf, firewall rules env, systemd env",
     },
+    "uplink_interface": {
+        "label": "Uplink interface (tor's internet route)",
+        "default": "wlan0",
+        "targets": "systemd env, tor container gate — read-only: this UI "
+                   "declares and validates the uplink, it never configures "
+                   "the link (no NetworkManager, no Wi-Fi credentials)",
+    },
     "gateway_ip": {
         "label": "Gateway IP",
         "default": "10.12.194.1",
@@ -134,6 +141,10 @@ def validate(values):
 
     if not INTERFACE_RE.fullmatch(v["interface"]):
         err("interface",
+            "interface name must match [a-zA-Z0-9_.:-] and be 1-15 characters")
+
+    if not INTERFACE_RE.fullmatch(v["uplink_interface"]):
+        err("uplink_interface",
             "interface name must match [a-zA-Z0-9_.:-] and be 1-15 characters")
 
     nets = {}

@@ -10,6 +10,7 @@ import struct
 import config_schema as schema
 import dockerops
 import render
+import uplink
 
 TOR_BOOTSTRAP_RE = re.compile(r"Bootstrapped (\d+)%")
 SOCKS_HOST = "127.0.0.1"
@@ -17,6 +18,12 @@ SOCKS_HOST = "127.0.0.1"
 
 def _dry():
     return os.environ.get("PI_TOR_UI_DRY_RUN") == "1"
+
+
+def _uplink_section(root):
+    values = render.read_current(root)["values"]
+    return uplink.panel(
+        values.get("uplink_interface") or schema.DEFAULTS["uplink_interface"])
 
 
 def dashboard(root):
@@ -32,6 +39,8 @@ def dashboard(root):
             "pihole": {"counters": None,
                        "note": "dry run: Pi-hole API not queried"},
             "rules": {"state": "n/a (dry run)"},
+            # the uplink panel is read-only, so it renders real data in dry run
+            "uplink": _uplink_section(root),
         }
 
     current = render.read_current(root)
@@ -73,6 +82,7 @@ def dashboard(root):
         out["pihole"]["note"] = f"Pi-hole API failed: {exc}"
 
     out["rules"] = dockerops.iptables_status()
+    out["uplink"] = _uplink_section(root)
     if "dns_port" not in sources or "socks_port" not in sources:
         out["config_note"] = "some config values fell back to defaults"
     return out

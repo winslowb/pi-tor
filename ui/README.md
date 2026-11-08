@@ -27,7 +27,8 @@ provides. Only run this UI on a network you control, and set a real
 | `app.py` | HTTP routing/serve (stdlib `http.server`), Basic auth |
 | `apply.py` | backup → atomic write → restart-what-changed → health poll |
 | `dockerops.py` | minimal stdin HTTP/1.1 client over the docker unix socket + compose/rules subprocess helpers |
-| `status.py` | dashboard JSON (services, bootstrap %, exit IP, counters, rules) |
+| `uplink.py` | read-only host network state: per-interface rows `ip -j addr`/`ip -j route`, `iw` SSID probe, uplink lease verdicts |
+| `status.py` | dashboard JSON (services, bootstrap %, exit IP, counters, rules, uplink) |
 | `templates/`, `static/` | the page; all assets local, no CDN/webfonts |
 
 ## HTTP surface
@@ -36,11 +37,11 @@ provides. Only run this UI on a network you control, and set a real
 |---|---|
 | `GET /` | dashboard + config form + raw-file viewer |
 | `GET /api/config` | parsed values (secrets masked), raw files, validation state |
-| `POST /api/preview` | `{values}` → per-file unified diff + errors; writes nothing |
-| `POST /api/apply` | `{confirm: true, values}` — backup, write, restart only what changed, health poll 90 s |
+| `POST /api/preview` | `{values}` → per-file unified diff + errors; writes nothing. A changed `uplink_interface` missing on this host is an **error** (400); missing lease/default route is a **warning** (write not blocked); response carries `warnings` |
+| `POST /api/apply` | `{confirm: true, values}` — backup, write, restart only what changed, health poll 90 s; the report echoes uplink `warnings` |
 | `POST /api/rollback` | restore newest `ui/backups/<stamp>/` and restart |
 | `GET /api/logs?service=tor|pihole&lines=200` | container logs |
-| `GET /api/status` | dashboard JSON |
+| `GET /api/status` | dashboard JSON, incl. the read-only `uplink` panel |
 
 Auth: HTTP Basic, user `pi-tor`, password from `PI_TOR_UI_PASSWORD`
 (`.env`), compared with `hmac.compare_digest`. Secrets never leave `/api/config`
@@ -66,12 +67,26 @@ masked; a blank/masked secret in a POST means *keep the current value*.
 ## Dry run
 
 `PI_TOR_UI_DRY_RUN=1` (compose passes `${PI_TOR_UI_DRY_RUN:-0}`) disables
-every docker socket call and every subprocess — the page, config parsing,
-preview, backup and file writes still work, so the image can be exercised
-on any machine with:
+every docker socket call and every privileged subprocess — the page, config
+parsing, preview, backup and file writes still work, so the image can be
+exercised on any machine with:
 
     docker run --rm -p 18080:8080 -e PI_TOR_UI_DRY_RUN=1 \
       -e PI_TOR_UI_PASSWORD=test -v "$PWD":/project pi-tor-ui:test
+
+Two deliberate exceptions keep working in dry run because they are
+strictly read-only: the uplink panel (`ip -j addr`, `ip -j route`,
+`iw dev <if> link`) and its submission checks. Nothing they run can
+change state.
+
+## Uplink panel
+
+The dashboard shows every non-loopback interface (name, operstate, IPv4,
+default route) plus a lease badge for the configured uplink: green =
+IPv4 + default route, amber = interface present without a lease or
+without the default route, red = absent. The Wi-Fi SSID is best effort
+via `iw`; when it is unavailable it reads *unknown* — names are never
+invented. The uplink panel renders identically in dry run.
 
 ## Tests
 

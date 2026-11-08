@@ -24,6 +24,7 @@ import config_schema as schema  # noqa: E402
 import dockerops  # noqa: E402
 import render  # noqa: E402
 import status as status_mod  # noqa: E402
+import uplink as uplink_mod  # noqa: E402
 
 UI_DIR = Path(__file__).resolve().parent
 ROOT = Path(os.environ.get("PI_TOR_PROJECT_DIR") or UI_DIR.parent)
@@ -179,9 +180,19 @@ class Handler(BaseHTTPRequestHandler):
                                        current["values"])
             errors = schema.validate(cfg)
             if errors:
-                self._json(400, {"errors": errors, "diffs": {}})
+                self._json(400, {"errors": errors, "warnings": [],
+                                 "diffs": {}})
                 return
-            self._json(200, {"errors": [], "diffs": render.diff_all(ROOT, cfg),
+            # host-aware uplink check: a changed uplink must exist on this
+            # host (error) or carry a lease/default route (warning)
+            uplink_errors, uplink_warnings = uplink_mod.submission(
+                cfg, current["values"])
+            if uplink_errors:
+                self._json(400, {"errors": uplink_errors,
+                                 "warnings": uplink_warnings, "diffs": {}})
+                return
+            self._json(200, {"errors": [], "warnings": uplink_warnings,
+                             "diffs": render.diff_all(ROOT, cfg),
                              "dry_run": dockerops._dry()})
         elif path == "/api/apply":
             if body.get("confirm") is not True:

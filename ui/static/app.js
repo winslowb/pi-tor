@@ -45,6 +45,7 @@ async function loadStatus() {
   if (st.dry_run) {
     div.innerHTML = '<div class="card"><div class="k">mode</div>' +
       '<div class="v">DRY RUN — docker calls and subprocesses disabled</div></div>';
+    renderUplink(st.uplink);
     return;
   }
   const bits = [];
@@ -67,6 +68,39 @@ async function loadStatus() {
   }
   bits.push(card("firewall rules", esc(st.rules?.state || "unknown")));
   div.innerHTML = bits.join("");
+  renderUplink(st.uplink);
+}
+
+// ---------------- uplink panel (read-only) ----------------
+
+function leaseBadge(lease) {
+  const map = {
+    "ok": ["ok", "lease ok"],
+    "no_ipv4": ["warn", "no lease"],
+    "no_route": ["warn", "no default route"],
+    "absent": ["bad", "absent"],
+    "unknown": ["warn", "unknown"],
+  };
+  const [cls, text] = map[lease] || ["warn", lease || "unknown"];
+  return `<span class="badge ${cls}">${esc(text)}</span>`;
+}
+
+function renderUplink(u) {
+  const div = $("uplink-panel");
+  if (!u || !u.interfaces) {
+    div.innerHTML = '<span class="muted">uplink data unavailable</span>';
+    return;
+  }
+  const rows = u.interfaces.map(i =>
+    `<tr><td>${esc(i.name)}</td><td>${esc(i.operstate || "?")}</td>` +
+    `<td>${esc((i.ipv4 || []).join(", ") || (i.ipv4 === null ? "unknown" : "—"))}</td>` +
+    `<td>${i.default_route ? "yes" : (i.default_route === null ? "?" : "—")}</td></tr>`
+  ).join("");
+  div.innerHTML =
+    `<div class="uplink-summary">${leaseBadge(u.lease)} ${esc(u.message || "")}` +
+    (u.ssid ? ` · ssid: ${esc(u.ssid)}` : "") + `</div>` +
+    `<table class="iftable"><thead><tr><th>interface</th><th>state</th>` +
+    `<th>IPv4</th><th>default route</th></tr></thead><tbody>${rows}</tbody></table>`;
 }
 
 // ---------------- config form ----------------
@@ -120,19 +154,23 @@ function collectValues() {
   return values;
 }
 
-function showErrors(errors) {
+function showErrors(errors, warnings) {
   const map = {};
   for (const e of errors || []) {
-    (map[e.key] = map[e.key] || []).push(e.message);
+    (map[e.key] = map[e.key] || []).push({msg: e.message, cls: "field-error"});
+  }
+  for (const w of warnings || []) {
+    (map[w.key] = map[w.key] || []).push({msg: w.message, cls: "field-warning"});
   }
   // inline per field
-  document.querySelectorAll("#config-form .field-error").forEach(n => n.remove());
-  for (const [key, msgs] of Object.entries(map)) {
+  document.querySelectorAll("#config-form .field-error, #config-form .field-warning")
+    .forEach(n => n.remove());
+  for (const [key, notes] of Object.entries(map)) {
     const input = document.querySelector(`#config-form [name="${key}"]`);
     if (input) {
       const note = document.createElement("div");
-      note.className = "field-error";
-      note.textContent = msgs.join("; ");
+      note.className = notes[0].cls;
+      note.textContent = notes.map(n => n.msg).join("; ");
       input.insertAdjacentElement("afterend", note);
     }
   }
@@ -168,11 +206,11 @@ async function preview() {
       headers: {"Content-Type": "application/json"},
       body: JSON.stringify({values: collectValues()}),
     });
-    showErrors(res.errors || []);
+    showErrors(res.errors || [], res.warnings || []);
     renderDiffs(res.diffs || {});
     setStatus("preview computed — nothing written", true);
   } catch (e) {
-    showErrors(e.data?.errors);
+    showErrors(e.data?.errors, e.data?.warnings);
     setStatus(`preview failed: ${e.message}`);
   }
 }
@@ -186,7 +224,7 @@ async function apply() {
       headers: {"Content-Type": "application/json"},
       body: JSON.stringify({confirm: true, values: collectValues()}),
     });
-    showErrors(res.errors || []);
+    showErrors(res.errors || [], res.warnings || []);
     const parts = [];
     parts.push(res.backup ? `backup: ${res.backup}` : "no changes to back up");
     for (const [svc, r] of Object.entries(res.restarts || {})) {
@@ -195,13 +233,16 @@ async function apply() {
       if (r.logs) parts.push(`<pre>${esc(r.logs)}</pre>`);
     }
     const notes = (res.notes || []).map(esc).join("<br>");
-    const html = parts.join("<br>") + (notes ? `<br><span class="muted">${notes}</span>` : "");
+    const warnNotes = (res.warnings || []).map(w => esc(w.message)).join("<br>");
+    const html = parts.join("<br>") +
+      (notes ? `<br><span class="muted">${notes}</span>` : "") +
+      (warnNotes ? `<br><span class="field-warning">⚠ ${warnNotes}</span>` : "");
     setStatus(html, !Object.values(res.restarts || {}).some(r => r.error));
     renderDiffs(Object.fromEntries(
       Object.entries(res.files || {}).map(([k, v]) =>
         [k, v.changed ? "(changed)" : null])));
   } catch (e) {
-    showErrors(e.data?.errors);
+    showErrors(e.data?.errors, e.data?.warnings);
     if (e.data?.errors) setStatus("validation failed — nothing applied");
     else setStatus(`apply failed: ${e.message}`);
   }

@@ -18,6 +18,7 @@ from pathlib import Path
 import config_schema as schema
 import dockerops
 import render
+import uplink
 
 # restart routing, expressed as key -> side effect
 PIHOLE_RECREATE_KEYS = ("tz", "pihole_webpassword", "dns_query_logging")
@@ -33,7 +34,7 @@ def apply_changes(root, posted, dry=None):
     current = render.read_current(root)
     cfg = schema.merge_secrets(schema.normalize_all(posted),
                                current["values"])
-    errors = schema.validate(cfg)
+    errors, uplink_warnings = _validated(cfg, current["values"])
     if errors:
         return {"ok": False, "errors": errors}
 
@@ -49,6 +50,7 @@ def apply_changes(root, posted, dry=None):
         "restarts": {},
         "notes": [],
         "errors": [],
+        "warnings": uplink_warnings,
     }
 
     if changed:
@@ -85,6 +87,13 @@ def apply_changes(root, posted, dry=None):
             "'docker compose up' of the ui service.")
 
     return report
+
+
+def _validated(cfg, current_values):
+    """Schema errors plus the host-aware uplink check (errors, warnings)."""
+    errors = schema.validate(cfg)
+    u_errors, u_warnings = uplink.submission(cfg, current_values)
+    return errors + u_errors, u_warnings
 
 
 def _restart_with_health(name, started=True):

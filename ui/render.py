@@ -89,6 +89,9 @@ PI_TOR_GATEWAY={cfg['gateway_ip']}
 # Ports exposed by tor inside the docker-compose stack
 PI_TOR_TRANS_PORT={cfg['trans_port']}
 PI_TOR_DNS_PORT={cfg['dns_port']}
+
+# Uplink interface tor must bootstrap through
+PI_TOR_UPLINK={cfg['uplink_interface']}
 """
 
     envfile = f"""# Copy this file to `.env` and adjust values as needed.
@@ -255,6 +258,7 @@ def read_current(root):
 
     if systemd:
         for env_key, key in (("PI_TOR_INTERFACE", "interface"),
+                             ("PI_TOR_UPLINK", "uplink_interface"),
                              ("PI_TOR_SUBNET", "subnet"),
                              ("PI_TOR_GATEWAY", "gateway_ip"),
                              ("PI_TOR_TRANS_PORT", "trans_port"),

@@ -5,15 +5,23 @@ services:
     container_name: tor
     network_mode: "host"
     restart: unless-stopped
+    environment:
+      PI_TOR_UPLINK: "${PI_TOR_UPLINK:-wlan0}"
     volumes:
       - ./tor/torrc:/etc/tor/torrc:ro
       - ./tor/tor-data:/var/lib/tor
+      # uplink gate, read-only (see bin/uplink-check.sh). It is deliberately
+      # only on this service: pihole and ui must still start when the uplink
+      # is broken, so the dashboard can explain why tor is down — a gate on
+      # the whole stack would take the UI offline exactly when it is needed.
+      - ./bin/uplink-check.sh:/usr/local/bin/uplink-check.sh:ro
     cap_add:
       - NET_ADMIN
-    command: >
+    command: >-
       /bin/sh -c
       "chmod 700 /var/lib/tor &&
        chown -R debian-tor:debian-tor /var/lib/tor &&
+       /usr/local/bin/uplink-check.sh &&
        exec /usr/bin/tor -f /etc/tor/torrc"
     healthcheck:
       test: ["CMD-SHELL", "sh -c 'tor-resolve example.com 127.0.0.1:9050 >/dev/null 2>&1'"]

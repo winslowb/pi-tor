@@ -9,6 +9,10 @@ A minimal Docker stack for a USB-gadget Raspberry Pi that runs Pi-hole as the DN
   Tor as its upstream resolver
 - Idempotent iptables helper (`bin/pi-tor-rules.sh`) that turns the Pi into a
   transparent proxy for the gadget interface
+- `bin/uplink-check.sh` gates **only** the tor container: tor refuses to
+  start when the uplink interface has no IPv4 lease or no default route.
+  Pi-hole and the UI still start so the dashboard can explain why tor is
+  down. The config UI shows a read-only per-interface uplink panel
 - Optional systemd units for auto-starting the stack and the firewall rules
 - A small configuration web UI (`ui/`) that renders every config file from
   one validated schema, previews diffs, applies with backup + restart, and
@@ -93,6 +97,10 @@ following files if your gadget interface or network differs:
 - `.env` – Pi-hole timezone/password/logging
 - `systemd/pi-tor.env.example` / `bin/pi-tor-rules.sh` env vars – interface and
   subnet controls
+- `PI_TOR_UPLINK` – the interface tor must bootstrap through (default
+  `wlan0`; set in `.env` before `docker compose up`, or `PI_TOR_UPLINK=`
+  on the compose shell env). The UI validates it but never configures the
+  link itself — joining a Wi-Fi network stays your job
 
 ## Systemd (optional)
 
@@ -124,7 +132,8 @@ docker-compose.yml         # Tor + Pi-hole stack
 pihole/etc-dnsmasq.d/      # Pi-hole dnsmasq overrides (tracked)
 pihole/etc-pihole/.gitkeep # bind mount placeholder (data ignored)
 tor/                       # Dockerfile + torrc + data dir placeholder
-bin/pi-tor-rules.sh        # iptables helper
+bin/pi-tor-rules.sh        # iptables helper (apply|flush|show-rules)
+bin/uplink-check.sh        # tor-side uplink gate (IPv4 lease + default route)
 systemd/                   # optional unit files + env example
 collect_pi_support.sh      # diagnostics helper
 ```

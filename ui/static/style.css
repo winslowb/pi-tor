@@ -6,6 +6,7 @@
   --muted: #928374;
   --red: #fb4934;
   --green: #b8bb26;
+  --amber: #d79921;
   --card: #32302f;
   --border: #504945;
   --input: #3c3836;
@@ -89,10 +90,42 @@ input, select {
 }
 input[type="password"] { font-family: monospace; }
 .field-error { color: var(--red); font-size: .85rem; }
+.field-warning { color: var(--amber); font-size: .85rem; }
 
 .errors { color: var(--red); margin: .5rem 0; }
 .ok-message { color: var(--green); }
 .muted { color: var(--muted); }
+
+.badge {
+  display: inline-block;
+  border-radius: 3px;
+  padding: .05rem .45rem;
+  font-size: .75rem;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: .04em;
+  color: #282828;
+}
+.badge.ok   { background: var(--green); }
+.badge.warn { background: var(--amber); }
+.badge.bad  { background: var(--red); }
+
+.uplink-summary { margin: .3rem 0 .5rem; }
+.iftable {
+  border-collapse: collapse;
+  width: 100%;
+  font-size: .85rem;
+  background: var(--card);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+}
+.iftable th, .iftable td {
+  text-align: left;
+  padding: .35rem .7rem;
+  border-bottom: 1px solid var(--border);
+}
+.iftable th { color: var(--muted); font-weight: 600; text-transform: uppercase; font-size: .7rem; }
+.iftable tr:last-child td { border-bottom: 0; }
 
 pre {
   background: var(--deep);

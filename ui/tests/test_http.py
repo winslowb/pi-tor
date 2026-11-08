@@ -153,9 +153,19 @@ class DryRunTest(HttpTestBase):
 
     def test_dry_run_makes_no_privileged_calls(self):
         dockerops.counters.update({"socket_calls": 0, "subprocess_calls": 0})
-        with mock.patch.object(
-                dockerops.subprocess, "run",
-                side_effect=AssertionError("subprocess during dry run")):
+
+        def _deny(*popenargs, **kwargs):
+            argv = popenargs[0] if popenargs else (kwargs.get("args") or [])
+            head = list(argv[:2]) if isinstance(argv, (list, tuple)) else []
+            # read-only network inspection is allowed in dry run: the
+            # uplink panel renders real data and changes no state. Any
+            # other subprocess (docker, iptables, nmcli, ...) must never run.
+            if head and (head[0] == "ip" and head[1] == "-j" or
+                         head[0] == "iw"):
+                return mock.Mock(returncode=0, stdout="", stderr="")
+            raise AssertionError(f"subprocess during dry run: {argv!r}")
+
+        with mock.patch.object(dockerops.subprocess, "run", new=_deny):
             code, _, _ = self.client.request("GET", "/")
             self.assertEqual(code, 200)
             code, _, _ = self.client.request("GET", "/static/style.css")
@@ -163,6 +173,8 @@ class DryRunTest(HttpTestBase):
             code, _, status = self.client.json("GET", "/api/status")
             self.assertEqual(code, 200)
             self.assertTrue(status.get("dry_run"))
+            # the uplink panel renders real data even in dry run
+            self.assertIn("uplink", status)
             self.client.json("GET", "/api/logs?service=tor&lines=50")
             self.client.json("POST", "/api/preview",
                              body={"values": {"tz": "Europe/Rome"}})
