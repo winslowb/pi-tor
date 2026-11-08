@@ -37,6 +37,10 @@ set -u
 NAME=pi-tor-gadget
 ADDR="${PI_TOR_HOST_ADDR:-10.12.194.2}/24"
 GLOBS="enx*,usb*"
+# nmcli requires match.* properties as TWO argv elements (property, then
+# value). The "match.interface-name=value" form is rejected outright with
+# "invalid property 'interface-name=...'", and no amount of comma escaping
+# helps. The comma-separated list itself is fine as a single value.
 
 DRY=0; FORCE=0; REMOVE=0
 usage() { echo "usage: bin/usb_host_profile [--dry-run] [--force] [--remove]" >&2; exit 2; }
@@ -73,10 +77,10 @@ profile_exists() {
 
 ADD_PL=(
   connection add type ethernet con-name "$NAME"
-  "match.interface-name=$GLOBS"
+  match.interface-name "$GLOBS"
   connection.autoconnect yes
   connection.autoconnect-priority 10
-  ipv4.method manual "ipv4.addresses=$ADDR"
+  ipv4.method manual ipv4.addresses "$ADDR"
   ipv4.never-default yes
 )
 DELETE_PL=(connection delete "$NAME")

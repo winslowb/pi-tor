@@ -29,11 +29,11 @@ exit 0
 MUTATIONS = ("connection add", "connection delete", "connection up")
 
 PLAN_FRAGMENTS = (
-    "match.interface-name=enx*,usb*",
+    "match.interface-name enx*,usb*",
     "connection.autoconnect yes",
     "connection.autoconnect-priority 10",
     "ipv4.method manual",
-    "ipv4.addresses=10.12.194.2/24",
+    "ipv4.addresses 10.12.194.2/24",
     "ipv4.never-default yes",
     # DNS is left at NM's default (empty) by OMITTING the property: nmcli
     # rejects a bare "ipv4.dns=" as "invalid property 'dns='".
@@ -84,14 +84,14 @@ class HostProfileTest(unittest.TestCase):
         self.assertEqual(res.returncode, 0, res.stderr)
         for fragment in PLAN_FRAGMENTS:
             self.assertIn(fragment, res.stdout)
-        # No planned argument may carry an empty value: nmcli parses a bare
-        # "ipv4.dns=" as the property name "dns=" and aborts the whole
-        # connection add. This is the assertion that would have caught it.
-        for token in res.stdout.split():
-            self.assertFalse(
-                token.startswith(("ipv4.", "connection.", "match.")) and token.endswith("="),
-                f"empty-valued nmcli argument in the plan: {token!r}",
-            )
+        # This nmcli (NetworkManager 1.46) wants `property value` pairs and
+        # rejects `property=value` for match.* and ipv4.addresses with
+        # "invalid property '<name>=<value>'". Asserting no argument contains
+        # "=" at all catches that whole class, which a stub nmcli cannot see.
+        add_line = [l for l in res.stdout.splitlines()
+                    if "nmcli connection add" in l][0]
+        self.assertNotIn("=", add_line.split("nmcli connection add", 1)[1],
+                         f"property=value form is rejected by this nmcli: {add_line!r}")
         self.assertNotIn("connection delete", res.stdout)
         case.assert_no_mutation(self)
         # the existence check is the only real (stubbed) call, and it is
