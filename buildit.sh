@@ -154,24 +154,6 @@ BASH
 chmod +x "${BASE}/bin/pi-tor-rules.sh"
 
 ############################
-# systemd unit for iptables rules
-############################
-cat > "${BASE}/systemd/pi-tor-rules.service" <<SYSTEMD
-[Unit]
-Description=Apply iptables rules for Pi Tor transparent proxy
-After=network-online.target docker.service
-Wants=network-online.target
-
-[Service]
-Type=oneshot
-ExecStart=${BASE}/bin/pi-tor-rules.sh
-RemainAfterExit=yes
-
-[Install]
-WantedBy=multi-user.target
-SYSTEMD
-
-############################
 # systemd unit for docker compose stack
 ############################
 cat > "${BASE}/systemd/pi-tor-stack.service" <<SYSTEMD
@@ -195,7 +177,6 @@ SYSTEMD
 ############################
 # Symlink units into /etc/systemd/system
 ############################
-sudo ln -sf "${BASE}/systemd/pi-tor-rules.service" /etc/systemd/system/pi-tor-rules.service
 sudo ln -sf "${BASE}/systemd/pi-tor-stack.service"  /etc/systemd/system/pi-tor-stack.service
 
 # Ownership so you can edit as bill; docker will still run as root
@@ -205,13 +186,9 @@ echo "Building and starting stack..."
 cd "${BASE}"
 sudo /usr/bin/docker-compose up -d --build
 
-echo "Applying iptables rules..."
-sudo "${BASE}/bin/pi-tor-rules.sh"
-
 echo "Enabling services..."
 sudo systemctl daemon-reload
 sudo systemctl enable --now pi-tor-stack.service
-sudo systemctl enable --now pi-tor-rules.service
 
 echo "Done."
 echo "Project home: ${BASE}"

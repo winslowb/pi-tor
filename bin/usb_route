@@ -1,31 +1,168 @@
-#!/bin/bash -x
+#!/bin/bash
+# Route this workstation through the Pi-Hole/tor gadget over USB.
+# Interface-agnostic: detect the gadget (enx*/usb*), detect the primary
+# interface (whatever holds the default route), save that exact state, change
+# the route/DNS, and verify. bin/usb_route_undo restores exactly the saved
+# values. --dry-run prints the plan and changes nothing (the test suite's
+# only mode). Requires systemd-resolved.
+set -euo pipefail
 
-export USB=` ip -br link show|grep enx|awk '{print $1}'`
-export IF=` ip -br link show|grep enx|awk '{print $1}'`
+SUBNET="${PI_TOR_SUBNET:-10.12.194.0/24}"   # gadget subnet; matches bin/pi-tor-rules.sh
+GATEWAY="${PI_TOR_GATEWAY:-10.12.194.1}"    # the Pi side of that subnet
+STATE_DIR="${PI_TOR_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/pi-tor}"
+STATE_FILE="$STATE_DIR/tether.conf"
+NET_DIR="${PI_TOR_NET_DIR:-/sys/class/net}" # PI_TOR_NET_DIR is a test seam
 
-echo $USB; echo $IF
+MODE=apply
+case "${1:-}" in
+  "") ;;
+  --dry-run) MODE=dry ;;
+  *) echo "usage: ${0##*/} [--dry-run]" >&2; exit 2 ;;
+esac
 
-sudo ip link set wlp3s0 down
+die() { echo "ERROR: $*" >&2; exit 1; }
+note() { echo "note: $*"; }
+# plan prints the exact argv it would run; executes only outside --dry-run.
+plan() {
+  echo "+ $*"
+  if [ "$MODE" = dry ]; then return 0; fi
+  "$@"
+}
+run_sudo() {
+  if [ "$(id -u)" = 0 ]; then plan "$@"; else plan sudo "$@"; fi
+}
 
-# 1) Put the USB link on the /24 
-sudo ip addr flush dev $USB
-sudo resolvectl flush-caches
-sudo ip addr add 10.12.194.2/24 dev $USB
-sudo ip link set $USB up
+default_route() { ip -4 route show default | head -n1; }
+# route_field LINE field: pull e.g. "dev"/"via"/"proto"/"metric" VALUE out of a route line
+route_field() { sed -n "s/.* $2 \([^ ]*\).*/\\1/p" <<<"$1"; }
 
-# 2) Send all traffic through the Pi (keep Wi-Fi up as a fallback with higher metric if you want)
-sudo ip route replace default via 10.12.194.1 dev $USB metric 5
+require_resolved() {
+  command -v resolvectl >/dev/null 2>&1 ||
+    die "resolvectl not found: usb_route manages systemd-resolved"
+}
 
-# 3) Make systemd-resolved use Pi-hole for all lookups on that link
-sudo resolvectl dns $USB 10.12.194.1
-sudo resolvectl domain $USB "~."
-sudo resolvectl flush-caches
+# link_dns LINK: the DNS servers currently set on that link.
+link_dns() {
+  resolvectl dns "$1" >/dev/null 2>&1 ||
+    die "resolvectl cannot reach systemd-resolved; is it running?"
+  resolvectl dns "$1" 2>/dev/null | sed 's/^[^)]*)[: ]*//' | head -n1
+}
+link_domain() {
+  resolvectl domain "$1" 2>/dev/null | sed 's/^[^)]*)[: ]*//' | head -n1
+}
 
-# 4) Sanity checks
-ping -c2 10.12.194.1
-dig @10.12.194.1 example.com +short
-curl -4 https://api.ipify.org   # should now be a Tor exit IP
+find_gadget() { # the enx*/usb* link; only disambiguated by subnet when several exist
+  local prefix="${SUBNET%/*}." cand addr
+  local cands=()
+  mapfile -t cands < <(ls "$NET_DIR" 2>/dev/null | grep -E '^(enx|usb)' || true)
+  if [ "${#cands[@]}" -eq 0 ]; then
+    die "no USB gadget interface (enx*/usb*) under $NET_DIR; plug in and boot the Pi first"
+  fi
+  if [ "${#cands[@]}" -eq 1 ]; then
+    echo "${cands[0]}" # a fresh attachment carries no address yet; it is still unambiguous
+    return
+  fi
+  for cand in "${cands[@]}"; do
+    addr=$(ip -o -4 addr show dev "$cand" 2>/dev/null | awk '{print $4}')
+    case "$addr" in "$prefix"*) echo "$cand"; return ;; esac
+  done
+  die "several gadget interfaces (${cands[*]}) and none carries an address in $SUBNET"
+}
 
+find_primary() { # sets PRIMARY, PRIMARY_GW, PRIMARY_PROTO, PRIMARY_METRIC
+  local route
+  route=$(default_route)
+  [ -n "$route" ] || die "no default route found; connect to a network first"
+  PRIMARY=$(route_field "$route" dev)
+  PRIMARY_GW=$(route_field "$route" via)
+  PRIMARY_PROTO=$(route_field "$route" proto)
+  PRIMARY_METRIC=$(route_field "$route" metric)
+  [ -n "$PRIMARY" ] || die "could not read an interface from the default route: $route"
+}
 
-CU=`curl -4 https://api.ipify.org`  
-curl https://ipinfo.io/$CU|jq 
+gadget_addr() { # host address on the gadget link: the subnet's .2 (subnet is /24, like every pi-tor default)
+  local net="${SUBNET%/*}"
+  echo "${net%.*}.2"
+}
+
+require_resolved
+GADGET=$(find_gadget)
+find_primary
+if [ "$PRIMARY" = "$GADGET" ]; then
+  die "the default route is already via $GADGET (the gadget): already tethered; run bin/usb_route_undo first"
+fi
+PRIMARY_DNS=$(link_dns "$PRIMARY")
+PRIMARY_DOMAIN=$(link_domain "$PRIMARY")
+GADGET_PRE_ADDR=$(ip -o -4 addr show dev "$GADGET" 2>/dev/null | awk '{print $4}')
+GADGET_PRE_ADDR="${GADGET_PRE_ADDR//$'\n'/ }"; GADGET_PRE_ADDR="${GADGET_PRE_ADDR% }"
+FLAGS=$(ip -o link show dev "$GADGET" 2>/dev/null | sed -n 's/.*<\(.*\)>.*/\1/p')
+case ",$FLAGS," in *",UP,"*) GADGET_WAS_UP=1 ;; *) GADGET_WAS_UP=0 ;; esac
+
+# The metric-5 gadget default outranks the DHCP default (100 wired, 600 Wi-Fi);
+# nothing is ever taken down. If a primary ever advertises metric<=5, drop the
+# gadget's metric below it instead of touching the primary's routes.
+GADGET_METRIC=5
+case "${PRIMARY_METRIC:-}" in
+  '' | *[!0-9]*) ;;
+  *) if [ "$PRIMARY_METRIC" -le 5 ]; then GADGET_METRIC=$((PRIMARY_METRIC - 1)); fi ;;
+esac
+if [ "$GADGET_METRIC" -lt 1 ]; then GADGET_METRIC=1; fi
+
+echo "gadget=$GADGET"
+echo "primary=$PRIMARY"
+echo "primary_gw=${PRIMARY_GW:-none} primary_proto=${PRIMARY_PROTO:-none} primary_metric=${PRIMARY_METRIC:-none}"
+echo "primary_dns=${PRIMARY_DNS:-none}"
+echo "primary_domain=${PRIMARY_DOMAIN:-none}"
+if [ -d "$NET_DIR/$PRIMARY/wireless" ]; then
+  note "$PRIMARY is Wi-Fi: the link stays up; the gadget default (metric $GADGET_METRIC) outranks its metric ${PRIMARY_METRIC:-unset}"
+fi
+if [ "$MODE" = dry ]; then
+  echo "state (on apply): would be written to $STATE_FILE"
+else
+  echo "state: $STATE_FILE"
+fi
+
+if [ "$MODE" = apply ]; then
+  # Write the snapshot before touching anything, so a crash here is undoable.
+  mkdir -p "$STATE_DIR"
+  {
+    echo "VERSION=1"
+    printf 'SUBNET=%q\n' "$SUBNET"
+    printf 'GATEWAY=%q\n' "$GATEWAY"
+    printf 'PRIMARY=%q\n' "$PRIMARY"
+    printf 'PRIMARY_GW=%q\n' "$PRIMARY_GW"
+    printf 'PRIMARY_PROTO=%q\n' "$PRIMARY_PROTO"
+    printf 'PRIMARY_METRIC=%q\n' "$PRIMARY_METRIC"
+    printf 'PRIMARY_DNS=%q\n' "$PRIMARY_DNS"
+    printf 'PRIMARY_DOMAIN=%q\n' "$PRIMARY_DOMAIN"
+    printf 'GADGET=%q\n' "$GADGET"
+    printf 'GADGET_PRE_ADDR=%q\n' "$GADGET_PRE_ADDR"
+    printf 'GADGET_WAS_UP=%q\n' "$GADGET_WAS_UP"
+  } > "$STATE_FILE"
+fi
+
+GA=$(gadget_addr)
+echo "plan:"
+run_sudo ip addr flush dev "$GADGET"
+run_sudo ip link set "$GADGET" up
+run_sudo ip addr add "$GA/24" dev "$GADGET"
+run_sudo ip route replace default via "$GATEWAY" dev "$GADGET" metric "$GADGET_METRIC"
+run_sudo resolvectl dns "$GADGET" "$GATEWAY"
+run_sudo resolvectl domain "$GADGET" "~."
+run_sudo resolvectl flush-caches
+
+if [ "$MODE" = apply ]; then
+  route_now=$(default_route)
+  echo "default: $route_now"
+  case "$route_now" in
+    *" dev $GADGET"*) ;;
+    *) die "verify failed: default route is not on $GADGET" ;;
+  esac
+  dns_now=$(link_dns "$GADGET")
+  echo "dns on $GADGET: ${dns_now:-none}"
+  case "$dns_now" in
+    *"$GATEWAY"*) ;;
+    *) die "verify failed: resolvectl dns $GADGET does not list $GATEWAY" ;;
+  esac
+  echo "tethered: default route and DNS on $GADGET point at $GATEWAY; undo with bin/usb_route_undo"
+fi
