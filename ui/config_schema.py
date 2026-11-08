@@ -45,6 +45,13 @@ FIELDS = {
         "default": "9040",
         "targets": "tor/torrc, rules env, systemd env",
     },
+    "protected_hosts": {
+        "label": "Protected hosts (IPv4, comma/space separated; empty = gateway)",
+        "default": "10.12.194.1",
+        "targets": "firewall rules env, systemd env — traffic to these hosts "
+                   "is never diverted into tor, so SSH :22, Pi-hole :80 and "
+                   "this UI :8080 keep working once the rules are applied",
+    },
     "dns_port": {
         "label": "Tor DNS port",
         "default": "5353",
@@ -146,6 +153,15 @@ def validate(values):
     if not INTERFACE_RE.fullmatch(v["uplink_interface"]):
         err("uplink_interface",
             "interface name must match [a-zA-Z0-9_.:-] and be 1-15 characters")
+
+    for host in [t for t in re.split(r"[,\s]+", v["protected_hosts"].strip())
+                 if t]:
+        try:
+            addr = ipaddress.ip_address(host)
+            if addr.version != 4:
+                raise ValueError
+        except ValueError:
+            err("protected_hosts", f"'{host}' must be an IPv4 address")
 
     nets = {}
     for key in ("subnet", "virtual_addr_network"):

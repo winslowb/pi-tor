@@ -8,7 +8,10 @@ A minimal Docker stack for a USB-gadget Raspberry Pi that runs Pi-hole as the DN
 - Pi-hole configured to listen only on gadget + loopback interfaces and to use
   Tor as its upstream resolver
 - Idempotent iptables helper (`bin/pi-tor-rules.sh`) that turns the Pi into a
-  transparent proxy for the gadget interface
+  transparent proxy for the gadget interface. `PI_TOR_PROTECTED_HOSTS`
+  (default: the gateway IP) keeps traffic to the Pi itself out of the
+  redirect, so SSH, Pi-hole and the config UI keep working; `show-rules`
+  prints the exact rule list without touching the firewall
 - `bin/uplink-check.sh` gates **only** the tor container: tor refuses to
   start when the uplink interface has no IPv4 lease or no default route.
   Pi-hole and the UI still start so the dashboard can explain why tor is
@@ -101,6 +104,8 @@ following files if your gadget interface or network differs:
   `wlan0`; set in `.env` before `docker compose up`, or `PI_TOR_UPLINK=`
   on the compose shell env). The UI validates it but never configures the
   link itself — joining a Wi-Fi network stays your job
+- `PI_TOR_PROTECTED_HOSTS` – IPv4 addresses never diverted into tor
+  (default: the gateway IP)
 
 ## Systemd (optional)
 

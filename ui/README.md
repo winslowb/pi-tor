@@ -79,7 +79,7 @@ strictly read-only: the uplink panel (`ip -j addr`, `ip -j route`,
 `iw dev <if> link`) and its submission checks. Nothing they run can
 change state.
 
-## Uplink panel
+## Uplink panel & protected hosts
 
 The dashboard shows every non-loopback interface (name, operstate, IPv4,
 default route) plus a lease badge for the configured uplink: green =
@@ -87,6 +87,12 @@ IPv4 + default route, amber = interface present without a lease or
 without the default route, red = absent. The Wi-Fi SSID is best effort
 via `iw`; when it is unavailable it reads *unknown* — names are never
 invented. The uplink panel renders identically in dry run.
+
+Hosts listed in `PI_TOR_PROTECTED_HOSTS` (schema field `protected_hosts`,
+default: the gateway IP) get a `-d <host> -j RETURN` rule at the top of
+the `PI_TOR_REDIRECT` chain, before every REDIRECT, so traffic to the Pi
+itself is never hijacked into tor. `bin/pi-tor-rules.sh show-rules`
+prints the chain rules in apply order without touching the firewall.
 
 ## Tests
 

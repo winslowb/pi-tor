@@ -200,6 +200,7 @@ RULES_ENV_KEYS = {
     "PI_TOR_GATEWAY": "gateway_ip",
     "PI_TOR_TRANS_PORT": "trans_port",
     "PI_TOR_DNS_PORT": "dns_port",
+    "PI_TOR_PROTECTED_HOSTS": "protected_hosts",
 }
 
 

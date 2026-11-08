@@ -22,6 +22,7 @@ class UplinkSchemaRenderTest(unittest.TestCase):
         rendered = render.render(schema.defaults())
         text = rendered["systemd/pi-tor.env.example"].decode()
         self.assertIn("PI_TOR_UPLINK=wlan0", text)
+        self.assertIn("PI_TOR_PROTECTED_HOSTS=10.12.194.1", text)
         # the committed render target must be regenerated to match
         self.assertEqual(rendered["systemd/pi-tor.env.example"],
                          (REPO / "systemd" / "pi-tor.env.example").read_bytes())
@@ -39,6 +40,7 @@ class UplinkSchemaRenderTest(unittest.TestCase):
             apply_mod._write_all(tree, rendered)
             parsed = render.read_current(tree)["values"]
             self.assertEqual(parsed["uplink_interface"], "eth5")
+            self.assertEqual(parsed["protected_hosts"], "10.12.194.1")
         finally:
             shutil.rmtree(tree, ignore_errors=True)
 

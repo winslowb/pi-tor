@@ -22,7 +22,8 @@ import uplink
 
 # restart routing, expressed as key -> side effect
 PIHOLE_RECREATE_KEYS = ("tz", "pihole_webpassword", "dns_query_logging")
-RULES_KEYS = ("interface", "subnet", "gateway_ip", "trans_port", "dns_port")
+RULES_KEYS = ("interface", "subnet", "gateway_ip", "trans_port", "dns_port",
+              "protected_hosts")
 UI_NOTE_KEYS = ("ui_port", "ui_password")
 
 

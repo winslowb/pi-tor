@@ -18,6 +18,48 @@ if [[ "$SUBNET_BITS" == "$SUBNET" ]]; then
 fi
 GATEWAY_CIDR="${GATEWAY_IP}/${SUBNET_BITS}"
 
+# Protected hosts: IPv4 addresses traffic to which must never be diverted
+# into tor (SSH :22, Pi-hole :80 and the config UI :8080 live on this host).
+# Comma- or space-separated; unset/empty falls back to the gateway IP.
+PROTECTED_HOSTS="${PI_TOR_PROTECTED_HOSTS:-${GATEWAY_IP}}"
+read -r -a PROTECTED_ARR <<< "${PROTECTED_HOSTS//,/ }"
+if [[ ${#PROTECTED_ARR[@]} -eq 0 ]]; then
+  PROTECTED_ARR=("$GATEWAY_IP")
+fi
+
+validate_protected_hosts() {
+  local h
+  for h in "${PROTECTED_ARR[@]}"; do
+    if [[ ! "$h" =~ ^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$ ]]; then
+      echo "[pi-tor] protected host '$h' is not an IPv4 address (PI_TOR_PROTECTED_HOSTS)" >&2
+      exit 64
+    fi
+  done
+}
+
+chain_rules() {
+  # The nat chain rules in apply order; show-rules prints the same list so
+  # the order can be inspected without root. The -j RETURN entries must
+  # come first: traffic to the protected hosts leaves the chain untouched
+  # before the catch-all tcp REDIRECT can grab it.
+  local h
+  for h in "${PROTECTED_ARR[@]}"; do
+    printf '%s\n' "-d $h -j RETURN"
+  done
+  printf '%s\n' "-p udp --dport 53 -j REDIRECT --to-ports $TOR_DNS_PORT"
+  printf '%s\n' "-p tcp --dport 53 -j REDIRECT --to-ports $TOR_DNS_PORT"
+  printf '%s\n' "-p tcp -j REDIRECT --to-ports $TOR_TRANS_PORT"
+}
+
+show_rules() {
+  local ipt="${IPTABLES_BIN:-iptables}"
+  echo "# bin/pi-tor-rules.sh would apply (no changes made); protected hosts never enter tor"
+  while IFS= read -r rule; do
+    printf '%s\n' "$ipt -t nat -A $CHAIN $rule"
+  done < <(chain_rules)
+  printf '%s\n' "$ipt -t nat -A PREROUTING -i $INTERFACE -j $CHAIN"
+}
+
 resolve_iptables() {
   if command -v iptables-nft >/dev/null 2>&1; then
     command -v iptables-nft
@@ -29,7 +71,7 @@ resolve_iptables() {
   fi
 }
 
-IPTABLES_BIN="${IPTABLES_BIN:-$(resolve_iptables)}"
+IPTABLES_BIN="${IPTABLES_BIN:-}"
 
 log() { printf '[pi-tor] %s\n' "$*"; }
 
@@ -67,9 +109,10 @@ apply_rules() {
     "$IPTABLES_BIN" -t nat -F "$CHAIN"
   fi
 
-  "$IPTABLES_BIN" -t nat -A "$CHAIN" -p udp --dport 53 -j REDIRECT --to-ports "$TOR_DNS_PORT"
-  "$IPTABLES_BIN" -t nat -A "$CHAIN" -p tcp --dport 53 -j REDIRECT --to-ports "$TOR_DNS_PORT"
-  "$IPTABLES_BIN" -t nat -A "$CHAIN" -p tcp -j REDIRECT --to-ports "$TOR_TRANS_PORT"
+  log "Protecting ${PROTECTED_HOSTS} from the redirect (RETURN first)"
+  while IFS= read -r rule; do
+    "$IPTABLES_BIN" -t nat -A "$CHAIN" $rule
+  done < <(chain_rules)
 
   add_rule_if_missing nat PREROUTING -i "$INTERFACE" -j "$CHAIN"
 
@@ -105,13 +148,20 @@ flush_rules() {
 
 case "$ACTION" in
   apply)
+    validate_protected_hosts
+    [[ -n "$IPTABLES_BIN" ]] || IPTABLES_BIN="$(resolve_iptables)"
     apply_rules
     ;;
   flush)
+    [[ -n "$IPTABLES_BIN" ]] || IPTABLES_BIN="$(resolve_iptables)"
     flush_rules
     ;;
+  show-rules)
+    validate_protected_hosts
+    show_rules
+    ;;
   *)
-    echo "Usage: $0 [apply|flush]" >&2
+    echo "Usage: $0 [apply|flush|show-rules]" >&2
     exit 64
     ;;
 esac

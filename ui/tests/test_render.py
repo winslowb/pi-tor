@@ -78,6 +78,7 @@ class RenderDefaultsTest(unittest.TestCase):
             "PI_TOR_GATEWAY": "10.44.0.1",
             "PI_TOR_TRANS_PORT": "9040",
             "PI_TOR_DNS_PORT": "5353",
+            "PI_TOR_PROTECTED_HOSTS": "10.12.194.1",
         })
 
         # parser round trip from a written tree
