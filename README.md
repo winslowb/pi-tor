@@ -109,6 +109,18 @@ following files if your gadget interface or network differs:
 - `.env` – Pi-hole timezone/password/logging
 - `systemd/pi-tor.env.example` / `bin/pi-tor-rules.sh` env vars – interface and
   subnet controls
+- `bin/usb_route` / `bin/usb_route_undo` – tether the workstation through the
+  Pi over the gadget link. Interface-agnostic: they detect the gadget (`enx*`/
+  `usb*`, preferring the one on the `PI_TOR_SUBNET` subnet when several exist),
+  detect the primary interface (whatever holds the default route — wired or
+  Wi-Fi), then save that exact state and restore exactly it. Nothing is taken
+  down: the gadget's metric-5 default simply outranks the DHCP default
+  (100 wired / 600 Wi-Fi), and if a primary ever advertises metric ≤ 5 the
+  tether lowers its own metric below it instead. Requires systemd-resolved.
+  Start with `bin/usb_route --dry-run`, then re-run without it; undo with
+  `bin/usb_route_undo` (which refuses if the saved state is missing). State
+  lives in `${XDG_STATE_HOME:-$HOME/.local/state}/pi-tor/tether.conf`;
+  overrides: `PI_TOR_SUBNET`, `PI_TOR_GATEWAY`, `PI_TOR_STATE_DIR`.
 - `PI_TOR_UPLINK` – the interface tor must bootstrap through (default
   `wlan0`; set in `.env` before `docker compose up`, or `PI_TOR_UPLINK=`
   on the compose shell env). The UI validates it but never configures the

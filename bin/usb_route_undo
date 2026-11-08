@@ -1,22 +1,95 @@
-#!/bin/bash 
-export USB=` ip -br link show|grep enx|awk '{print $1}'`
-export IF=` ip -br link show|grep enx|awk '{print $1}'`
-export WF=` ip -br link show|grep wlp3s0|awk '{print $1}'`
-sudo ip link set wlp3s0 up 
+#!/bin/bash
+# Undo bin/usb_route from its saved state: restore the exact previous default
+# route and per-link DNS on the previous interface, and remove only what
+# usb_route added (the gadget's address, DNS, link state, and its default).
+# --dry-run prints the plan. Refuses to invent anything when state is missing.
+set -euo pipefail
 
-# 1) undo all the routing stuff
+STATE_DIR="${PI_TOR_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/pi-tor}"
+STATE_FILE="$STATE_DIR/tether.conf"
+NET_DIR="${PI_TOR_NET_DIR:-/sys/class/net}" # PI_TOR_NET_DIR is a test seam
 
- sudo ip link set $USB down 
- sudo ip route del default via 10.12.194.1
- sudo ip addr flush dev $USB
- sudo resolvectl flush-caches
+MODE=apply
+case "${1:-}" in
+  "") ;;
+  --dry-run) MODE=dry ;;
+  *) echo "usage: ${0##*/} [--dry-run]" >&2; exit 2 ;;
+esac
 
-# 2) route out through your wifi and  and change named s'werver
- sudo resolvectl dns wlp3s0 192.168.0.1 # change this to whatever your regular named server is
- sudo ip route add default via 192.168.0.1
- sudo resolvectl domain $USB "~."
- sudo resolvectl dns $USB 192.168.0.1
- host cnn.com
- ping cnet.com -c 3
+die() { echo "ERROR: $*" >&2; exit 1; }
+note() { echo "note: $*"; }
+# plan prints the exact argv it would run; executes only outside --dry-run.
+plan() {
+  echo "+ $*"
+  if [ "$MODE" = dry ]; then return 0; fi
+  "$@"
+}
+run_sudo() {
+  if [ "$(id -u)" = 0 ]; then plan "$@"; else plan sudo "$@"; fi
+}
 
- sudo ip -br a 
+default_route() { ip -4 route show default | head -n1; }
+
+[ -f "$STATE_FILE" ] ||
+  die "no saved tether state at $STATE_FILE: nothing to undo (bin/usb_route writes it when it routes)"
+# The snapshot is machine-written with printf %q values; never hand-edit it.
+# shellcheck source=/dev/null
+. "$STATE_FILE"
+[ -n "${PRIMARY:-}" ] && [ -n "${GADGET:-}" ] ||
+  die "$STATE_FILE is missing PRIMARY/GADGET: state unusable, restore by hand or tether again"
+
+echo "saved: primary=$PRIMARY gadget=$GADGET"
+echo "saved: default_route=via ${PRIMARY_GW:-none} dev $PRIMARY${PRIMARY_PROTO:+ proto $PRIMARY_PROTO}${PRIMARY_METRIC:+ metric $PRIMARY_METRIC}"
+echo "saved: primary_dns=${PRIMARY_DNS:-none}"
+echo "saved: primary_domain=${PRIMARY_DOMAIN:-none}"
+
+restore=(ip route replace default)
+# Drop the empty fields so the restored route is exactly what was saved.
+if [ -n "${PRIMARY_GW:-}" ]; then restore+=(via "$PRIMARY_GW"); fi
+restore+=(dev "$PRIMARY")
+if [ -n "${PRIMARY_PROTO:-}" ]; then restore+=(proto "$PRIMARY_PROTO"); fi
+if [ -n "${PRIMARY_METRIC:-}" ]; then restore+=(metric "$PRIMARY_METRIC"); fi
+
+echo "plan:"
+route_now=$(default_route)
+case "$route_now" in
+  *" dev $GADGET"*) run_sudo ip route del default dev "$GADGET" ;;
+  *) note "no default route via $GADGET is present: nothing to delete" ;;
+esac
+run_sudo "${restore[@]}"
+if [ -n "${PRIMARY_DNS:-}" ]; then run_sudo resolvectl dns "$PRIMARY" $PRIMARY_DNS; fi
+if [ -n "${PRIMARY_DOMAIN:-}" ]; then run_sudo resolvectl domain "$PRIMARY" $PRIMARY_DOMAIN; fi
+if [ -d "$NET_DIR/$GADGET" ]; then
+  # A bare resolvectl dns/domain on a link clears that link's setting.
+  run_sudo resolvectl dns "$GADGET"
+  run_sudo resolvectl domain "$GADGET"
+  run_sudo ip addr flush dev "$GADGET"
+  for addr in ${GADGET_PRE_ADDR:-}; do run_sudo ip addr add "$addr" dev "$GADGET"; done
+  if [ "${GADGET_WAS_UP:-0}" = 0 ]; then run_sudo ip link set "$GADGET" down; fi
+else
+  note "gadget interface $GADGET is gone: skipping its cleanup (route and DNS still restored)"
+fi
+run_sudo resolvectl flush-caches
+echo "state: $STATE_FILE is removed after a successful restore"
+
+if [ "$MODE" = apply ]; then
+  route_now=$(default_route)
+  echo "default: $route_now"
+  case "$route_now" in
+    *" dev $PRIMARY"*) ;;
+    *) die "verify failed: default route is not back on $PRIMARY" ;;
+  esac
+  if [ -n "${PRIMARY_DNS:-}" ]; then
+    first="${PRIMARY_DNS%% *}"
+    dns_now=$(resolvectl dns "$PRIMARY" 2>/dev/null | sed 's/^[^)]*)[: ]*//' | head -n1)
+    echo "dns on $PRIMARY: ${dns_now:-none}"
+    case " $dns_now " in
+      *" $first "*) ;;
+      *) die "verify failed: resolvectl dns $PRIMARY is not $PRIMARY_DNS" ;;
+    esac
+  else
+    echo "(no per-link DNS was saved: nothing to verify)"
+  fi
+  rm -f "$STATE_FILE"
+  echo "untethered: default route and DNS restored on $PRIMARY"
+fi
