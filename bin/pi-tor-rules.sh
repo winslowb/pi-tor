@@ -51,6 +51,24 @@ chain_rules() {
   printf '%s\n' "-p tcp -j REDIRECT --to-ports $TOR_TRANS_PORT"
 }
 
+filter_rules() {
+  # The tether-side filter rules in apply order; show-rules prints them with
+  # the nat list so the whole picture is reviewable without root.
+  #
+  # Rationale: TCP and DNS are REDIRECTed into tor, but UDP is not, so QUIC
+  # would either go direct (unprotected) or hang; dropping non-DNS UDP makes
+  # browsers fall back to TCP. This also kills mDNS and any other UDP
+  # arriving on the tether, which is intended.
+  #
+  # Order matters. The DNSPort ACCEPT must precede the drop: nat REDIRECT
+  # rewrites tethered udp/53 to udp/$TOR_DNS_PORT before the filter table
+  # sees it, so the blanket non-DNS drop would otherwise kill tethered DNS.
+  # Both must precede the subnet ACCEPTs (added after these), which would
+  # otherwise white-list every tethered packet first.
+  printf '%s\n' "-i $INTERFACE -p udp --dport $TOR_DNS_PORT -j ACCEPT"
+  printf '%s\n' "-i $INTERFACE -p udp ! --dport 53 -j DROP"
+}
+
 show_rules() {
   local ipt="${IPTABLES_BIN:-iptables}"
   echo "# bin/pi-tor-rules.sh would apply (no changes made); protected hosts never enter tor"
@@ -58,6 +76,14 @@ show_rules() {
     printf '%s\n' "$ipt -t nat -A $CHAIN $rule"
   done < <(chain_rules)
   printf '%s\n' "$ipt -t nat -A PREROUTING -i $INTERFACE -j $CHAIN"
+  local chain rule
+  for chain in INPUT FORWARD; do
+    while IFS= read -r rule; do
+      printf '%s\n' "$ipt -t filter -A $chain $rule"
+    done < <(filter_rules)
+    printf '%s\n' "$ipt -t filter -A $chain -i $INTERFACE -s $SUBNET -j ACCEPT"
+  done
+  printf '%s\n' "$ipt -t filter -A FORWARD -o $INTERFACE -d $SUBNET -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT"
 }
 
 resolve_iptables() {
@@ -133,6 +159,17 @@ apply_rules() {
 
   add_rule_if_missing nat PREROUTING -i "$INTERFACE" -j "$CHAIN"
 
+  # The UDP rules go in before the subnet ACCEPTs: an ACCEPT first would
+  # white-list every tethered packet and the drop underneath would never fire.
+  log "Dropping non-DNS UDP arriving on ${INTERFACE} (tcp and DNS are redirected into tor; QUIC would go direct or hang without this, and mDNS/other tether UDP are killed too, which is intended)"
+  local chain
+  for chain in INPUT FORWARD; do
+    # ACCEPT first: nat REDIRECT rewrites tethered udp/53 to udp/$TOR_DNS_PORT
+    # before the filter table sees it, so the blanket drop would kill tethered DNS
+    add_rule_if_missing filter "$chain" -i "$INTERFACE" -p udp --dport "$TOR_DNS_PORT" -j ACCEPT
+    add_rule_if_missing filter "$chain" -i "$INTERFACE" -p udp '!' --dport 53 -j DROP
+  done
+
   log "Allowing ${SUBNET} on ${INTERFACE}"
   add_rule_if_missing filter INPUT -i "$INTERFACE" -s "$SUBNET" -j ACCEPT
   add_rule_if_missing filter FORWARD -i "$INTERFACE" -s "$SUBNET" -j ACCEPT
@@ -156,6 +193,13 @@ flush_rules() {
     "$IPTABLES_BIN" -t nat -F "$CHAIN"
     "$IPTABLES_BIN" -t nat -X "$CHAIN"
   fi
+
+  log "Removing non-DNS UDP drop rules"
+  local chain
+  for chain in INPUT FORWARD; do
+    delete_rule_if_present filter "$chain" -i "$INTERFACE" -p udp '!' --dport 53 -j DROP
+    delete_rule_if_present filter "$chain" -i "$INTERFACE" -p udp --dport "$TOR_DNS_PORT" -j ACCEPT
+  done
 
   log "Cleaning ACCEPT rules"
   delete_rule_if_present filter INPUT -i "$INTERFACE" -s "$SUBNET" -j ACCEPT
