@@ -1,4 +1,5 @@
 """Render/parse round-trip tests against the committed defaults."""
+import re
 import shutil
 import subprocess
 import sys
@@ -91,6 +92,95 @@ class RenderDefaultsTest(unittest.TestCase):
             self.assertEqual(parsed["gateway_ip"], "10.44.0.1")
         finally:
             shutil.rmtree(tree, ignore_errors=True)
+
+
+_BIND_RE = re.compile(r"^(SocksPort|TransPort|DNSPort)\s+(\d+\.\d+\.\d+\.\d+):(\d+)\s*$")
+_POLICY_RE = re.compile(r"^SocksPolicy\s+(.*)$")
+
+
+def _binds(torrc):
+    return [(m.group(1), m.group(2), m.group(3))
+            for line in torrc.splitlines()
+            for m in [_BIND_RE.match(line)] if m]
+
+
+def _policies(torrc):
+    return [m.group(1).strip()
+            for line in torrc.splitlines()
+            for m in [_POLICY_RE.match(line)] if m]
+
+
+class TorrcBindTest(unittest.TestCase):
+    """The listener topology tor starts under:
+
+    SOCKS is a single wildcard SocksPort whose SocksPolicy source ACL (a
+    per-connection check, first-match-wins with reject * last) serves
+    loopback and the subnet; DNS has a loopback listener for the local
+    dnsmasq upstream plus the gadget-address listener for queries redirected
+    off the gadget interface. Trans/DNS keep the gadget-address binds because
+    a nat PREROUTING REDIRECT rewrites the destination to the incoming
+    interface's own address, and those listeners have no source ACL, so they
+    must never go wildcard. Loopback service (healthcheck, dnsmasq) never
+    depends on the gadget interface being addressed.
+    """
+
+    def setUp(self):
+        self.torrc = render.render(schema.defaults())["tor/torrc"].decode()
+        self.gw = schema.DEFAULTS["gateway_ip"]
+        self.loopback = [b for b in _binds(self.torrc) if b[1] == "127.0.0.1"]
+        self.gadget = [b for b in _binds(self.torrc) if b[1] not in ("127.0.0.1", "0.0.0.0")]
+        self.wildcards = [b for b in _binds(self.torrc) if b[1] == "0.0.0.0"]
+
+    def test_torrc_loopback_ports_do_not_depend_on_gadget_address(self):
+        # loopback consumers today: tor's own healthcheck (SOCKS via
+        # 127.0.0.1, served by the wildcard + ACL) and Pi-hole's dnsmasq
+        # upstream (server=127.0.0.1#5353, served by the loopback DNSPort)
+        self.assertTrue(self.loopback, "no loopback listeners rendered")
+        for kind, addr, port in self.loopback:
+            self.assertEqual(addr, "127.0.0.1")
+            self.assertNotIn(self.gw, f"{addr}:{port}",
+                             f"loopback bind {kind} {addr}:{port} leaks the "
+                             f"gadget address")
+        socks_binds = [b for b in _binds(self.torrc) if b[0] == "SocksPort"]
+        self.assertEqual([(b[1], b[2]) for b in socks_binds],
+                         [("0.0.0.0", schema.DEFAULTS["socks_port"])],
+                         f"SOCKS must come from the wildcard listener only: "
+                         f"{socks_binds}")
+        dns_loop = [b for b in self.loopback if b[0] == "DNSPort"]
+        self.assertEqual([(b[2]) for b in dns_loop],
+                         [schema.DEFAULTS["dns_port"]],
+                         f"dnsmasq upstream needs a loopback DNSPort: "
+                         f"{self.loopback}")
+
+    def test_socksport_wildcard_has_reject_policy(self):
+        self.assertEqual([(b[0], b[1]) for b in self.wildcards],
+                         [("SocksPort", "0.0.0.0")],
+                         "SOCKS is the only wildcard-bindable port")
+        block = _policies(self.torrc)
+        print("rendered SocksPolicy block:", block, file=sys.stderr)
+        self.assertEqual(block, ["accept 127.0.0.1",
+                                 f"accept {schema.DEFAULTS['subnet']}",
+                                 "reject *"])
+        # first-match-wins ACL: the terminator must be last, after the
+        # loopback and subnet accepts, or non-listed sources would be
+        # accepted by tor's default
+        self.assertEqual(block[-1], "reject *")
+
+    def test_rendered_torrc_has_no_wildcard_trans_or_dns_port(self):
+        # REDIRECT's destination is the incoming interface's primary address
+        # (iptables-extensions(8), nf_nat_redirect_ipv4), so Trans/DNS keep
+        # the gadget-address bind; with no source ACL on those listeners the
+        # safety rule is a hard wildcard ban instead.
+        for kind, addr, port in _binds(self.torrc):
+            if kind == "SocksPort":
+                continue
+            self.assertIn(addr, ("127.0.0.1", self.gw),
+                          f"{kind} bound to {addr} - only loopback or the "
+                          f"gadget address may serve it")
+            self.assertNotEqual(addr, "0.0.0.0")
+        self.assertEqual([(k, p) for k, a, p in self.gadget],
+                         [("TransPort", "9040"), ("DNSPort", "5353")],
+                         f"gadget binds off-spec: {self.gadget}")
 
 
 class ExitNodesTest(unittest.TestCase):

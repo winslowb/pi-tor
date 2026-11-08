@@ -15,7 +15,11 @@ A minimal Docker stack for a USB-gadget Raspberry Pi that runs Pi-hole as the DN
 - `bin/uplink-check.sh` gates **only** the tor container: tor refuses to
   start when the uplink interface has no IPv4 lease or no default route.
   Pi-hole and the UI still start so the dashboard can explain why tor is
-  down. The config UI shows a read-only per-interface uplink panel
+  down. The config UI shows a read-only per-interface uplink panel. Before
+  tor starts, the same container also briefly waits (bounded to 30 s, one
+  log line per second, addresses scraped from the mounted `torrc`) for the
+  gadget-subnet binds to become assignable, so a `usb0` that is attached
+  but not yet addressed does not crash-loop tor
 - Optional systemd units for auto-starting the stack and the firewall rules
 - A small configuration web UI (`ui/`) that renders every config file from
   one validated schema, previews diffs, applies with backup + restart, and

@@ -47,6 +47,38 @@ Auth: HTTP Basic, user `pi-tor`, password from `PI_TOR_UI_PASSWORD`
 (`.env`), compared with `hmac.compare_digest`. Secrets never leave `/api/config`
 masked; a blank/masked secret in a POST means *keep the current value*.
 
+## Tor listener topology (why the binds look like this)
+
+`torrc` binds three kinds of listeners and they differ in what may depend on
+the gadget interface:
+
+- `SocksPort 0.0.0.0:<socks>` — the only wildcard bind. It exists so tor can
+  bind before `usb0` is addressed (the healthcheck and the workstation both
+  go through it), and it is safe only because `SocksPolicy` below it is a
+  source ACL tor enforces per connection (`accept 127.0.0.1`, `accept
+  <subnet>`, `reject *` last — non-listed sources are accepted by default, so
+  the terminator must stay last). A second explicit-loopback `SocksPort` on
+  the same port cannot co-exist with the wildcard listener: the kernel
+  refuses with EADDRINUSE in either bind order (verified against tor
+  0.4.9).
+- `TransPort <gateway>:<port>` and `DNSPort <gateway>:<port>` — the service
+  path. A nat `PREROUTING` REDIRECT rewrites the destination to the incoming
+  interface's own primary address (not loopback; locally-generated packets
+  are the ones mapped to 127.0.0.1), so these binds require the gadget
+  address. They **must never go wildcard**: neither listener has a source
+  ACL, so a wildcard would expose an unauthenticated transparent proxy and
+  an open resolver on the Pi's other interfaces (e.g. Wi-Fi). `DNSPort` also
+  binds `127.0.0.1` because Pi-hole's dnsmasq upstream is
+  `server=127.0.0.1#<dns>`.
+
+`bin/uplink-check.sh` covers the start-ordering gap: after the uplink gate
+passes it waits up to 30 s (one log line per second) until every gadget
+address scraped from the mounted `torrc` is assigned to the host; the
+addresses come from `torrc` itself so the wait cannot drift from the
+rendered config, and it reads `/proc/net/fib_trie` because the tor image has
+no `ip`. If the bound is reached the container exits 1 and keeps
+restart-looping slowly, with the dashboard still explaining why tor is down.
+
 ## Apply semantics
 
 1. Files that change are backed up to `ui/backups/<UTC-stamp>/` (relative

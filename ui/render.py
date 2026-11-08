@@ -27,18 +27,24 @@ def render(cfg):
 Log notice stdout
 AvoidDiskWrites 1
 
-# SOCKS: allow localhost (for healthcheck) and your USB subnet (for the workstation)
-SocksPort 127.0.0.1:{cfg['socks_port']}
-SocksPort {cfg['gateway_ip']}:{cfg['socks_port']}
+# SOCKS: the wildcard listener binds before the gadget interface is addressed
+# and serves loopback (healthcheck) and the workstation; SocksPolicy below is
+# a source ACL tor enforces per connection - this is the only wildcard bind.
+# A second explicit-loopback SocksPort on the same port cannot co-exist with
+# the wildcard bind (EADDRINUSE in either order, tor 0.4.9)
+SocksPort 0.0.0.0:{cfg['socks_port']}
 SocksPolicy accept 127.0.0.1
 SocksPolicy accept {cfg['subnet']}
 SocksPolicy reject *
 
-# Transparent proxy: bind to loopback to avoid "public address" warning
-# (iptables REDIRECT delivers locally, so 127.0.0.1 is perfect)
+# Transparent proxy: a nat PREROUTING REDIRECT rewrites the destination to
+# the incoming interface's own address (not loopback), so this must keep the
+# gadget-address bind and must never become a wildcard - TransPort has no ACL
 TransPort {cfg['gateway_ip']}:{cfg['trans_port']}
 
-# DNS stays local-only (Pi-hole upstream or NAT redirect will use this)
+# DNS: loopback serves the local dnsmasq upstream; the gadget address serves
+# DNS redirected off the gadget interface. Same no-wildcard rule as TransPort
+DNSPort 127.0.0.1:{cfg['dns_port']}
 DNSPort {cfg['gateway_ip']}:{cfg['dns_port']}
 
 VirtualAddrNetworkIPv4 {cfg['virtual_addr_network']}
@@ -167,7 +173,9 @@ _TORRC_RES = [
     (re.compile(r"^DNSPort\s+(\S+?):(\d+)\s*$"), "dns_port"),
 ]
 _LO_RE = re.compile(r"(?:SocksPort|TransPort|DNSPort)\s+127\.0\.0\.1")
-_GW_BIND_RE = re.compile(r"^(?:SocksPort|TransPort|DNSPort)\s+(?!127\.0\.0\.1)([0-9.]+):(\d+)")
+# Non-loopback bind addresses; 0.0.0.0 is the wildcard SocksPort, never the
+# gateway, so it must not be parsed as one
+_GW_BIND_RE = re.compile(r"^(?:SocksPort|TransPort|DNSPort)\s+(?!127\.0\.0\.1|0\.0\.0\.0)([0-9.]+):(\d+)")
 _POLICY_ACCEPT_RE = re.compile(r"^SocksPolicy\s+accept\s+(\S+)\s*$")
 _VIRTUAL_RE = re.compile(r"^VirtualAddrNetworkIPv4\s+(\S+)\s*$")
 _EXCLUDE_RE = re.compile(r"^ExcludeExitNodes\s+(\S+)\s*$")
