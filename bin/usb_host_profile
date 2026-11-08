@@ -1,0 +1,114 @@
+#!/bin/bash
+# bin/usb_host_profile — keep the TETHERING HOST side configured across
+# gadget re-enumerations.
+#
+# Why this is needed: a g_ether reload (or any cable reseat) re-enumerates
+# the USB gadget, so the host's interface disappears and comes back with a
+# NEW name (enx* or usb*) and no address. NetworkManager's auto-created
+# "Wired connection N" for the new name then sits in "connecting (getting
+# IP configuration)" DHCP-polling forever and flushes static addresses off
+# the interface — which produced hours of false "the Pi is dead" diagnoses
+# while the Pi itself had recovered. The cure is one static NM profile that
+# follows the interface across renames; declaring the interface unmanaged
+# is only a workaround and does not survive a re-enumeration.
+#
+# Match strategy: match.interface-name globs "enx*,usb*" on the connection
+# (NetworkManager >= 1.14), NOT connection.interface-name. A kernel
+# interface-name binding is too narrow — it dies on the first rename —
+# while the NAME SHAPE is stable: the kernel names gadget-side ethernet
+# interfaces enx<MAC> (predictable naming on) or usb<N> (naming off), under
+# any of the host-side gadget drivers. Driver-based matching was rejected
+# because the driver set is open-ended (cdc_ether, cdc_ncm, rndis_host,
+# eem, ...).
+#
+# The address is STATIC (PI_TOR_HOST_ADDR, default 10.12.194.2, /24 fixed —
+# the repo's gadget subnet), with no gateway, ipv4.never-default yes and
+# empty ipv4.dns, so the gadget never steals the real default route or
+# resolver. autoconnect-priority is raised above NM's auto-created
+# "Wired connection N" so this profile wins on the original name too.
+#
+# Usage: bin/usb_host_profile [--dry-run] [--force] [--remove] [-h|--help]
+#   --dry-run  print the exact nmcli commands, change nothing
+#   --force    apply even when a profile named pi-tor-gadget already exists
+#   --remove   remove (or print the removal of) the profile instead
+# Exit: 0 ok, 1 refused (profile exists / nothing to remove), 2 usage error.
+set -u
+
+NAME=pi-tor-gadget
+ADDR="${PI_TOR_HOST_ADDR:-10.12.194.2}/24"
+GLOBS="enx*,usb*"
+
+DRY=0; FORCE=0; REMOVE=0
+usage() { echo "usage: bin/usb_host_profile [--dry-run] [--force] [--remove]" >&2; exit 2; }
+for arg in "$@"; do
+  case "$arg" in
+    --dry-run) DRY=1 ;;
+    --force)   FORCE=1 ;;
+    --remove)  REMOVE=1 ;;
+    -h|--help) usage ;;
+    *) echo "bin/usb_host_profile: unknown argument: $arg" >&2; usage ;;
+  esac
+done
+
+# every mutation goes through here so --dry-run can only ever print
+nm() {
+  if [ "$DRY" -eq 1 ]; then
+    echo "would run: nmcli $*"
+  else
+    nmcli "$@"
+  fi
+}
+read_only() { # existence checks run even under --dry-run (read only)
+  if [ "$DRY" -eq 1 ]; then
+    echo "would check: nmcli $*" >&2
+    nmcli "$@" 2>/dev/null
+  else
+    nmcli "$@"
+  fi
+}
+
+profile_exists() {
+  read_only -t -f NAME connection show | grep -Fxq "$NAME"
+}
+
+ADD_PL=(
+  connection add type ethernet con-name "$NAME"
+  "match.interface-name=$GLOBS"
+  connection.autoconnect yes
+  connection.autoconnect-priority 10
+  ipv4.method manual "ipv4.addresses=$ADDR"
+  ipv4.never-default yes "ipv4.dns="
+)
+DELETE_PL=(connection delete "$NAME")
+
+if [ "$REMOVE" -eq 1 ]; then
+  if ! profile_exists; then
+    echo "bin/usb_host_profile: profile '$NAME' is not present; nothing to remove"
+    exit 0
+  fi
+  echo "removing NetworkManager profile '$NAME' (the gadget interface will go back to no address)"
+  nm "${DELETE_PL[@]}"
+else
+  if profile_exists && [ "$FORCE" -eq 0 ]; then
+    echo "bin/usb_host_profile: profile '$NAME' already exists; refusing." >&2
+    echo "Use --force to replace it, or --dry-run to inspect without changing anything." >&2
+    exit 1
+  fi
+  if [ "$FORCE" -eq 1 ]; then
+    echo "replacing profile '$NAME' (delete + re-add because of --force)"
+    nm "${DELETE_PL[@]}"
+  fi
+  echo "creating NM profile '$NAME': static $ADDR, no gateway, never-default, dns empty,"
+  echo "matches gadget interfaces by name glob: $GLOBS"
+  nm "${ADD_PL[@]}"
+  # take the interface over right away if the DHCP-polling auto profile
+  # currently owns it; tolerated to fail when no gadget is plugged in
+  if [ "$DRY" -eq 1 ]; then
+    echo "note: 'connection up' may fail when no matching gadget interface is currently up; the profile auto-connects when one appears"
+  fi
+  if nm connection up "$NAME"; then
+    :
+  else
+    echo "bin/usb_host_profile: no matching gadget interface is up right now; the profile will auto-connect when one appears"
+  fi
+fi
