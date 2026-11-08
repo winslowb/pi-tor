@@ -38,13 +38,18 @@ def _unix_http(method, path, body=b"", timeout=30):
            f"Content-Type: application/json\r\nConnection: close\r\n"
            f"Content-Length: {len(body)}\r\n\r\n")
     s.sendall(req.encode() + body)
-    try:
-        s.shutdown(socket.SHUT_WR)
-    except OSError:
-        pass
+    # Do NOT half-close the write side. Docker's Go server reads the EOF as a
+    # client abort: the identical request returns 200 with an EMPTY body for
+    # /containers/<name>/logs and 500 for /version, while the same bytes sent
+    # without the half-close return the whole response. Content-Length already
+    # delimits the request, so the half-close bought nothing and silently
+    # emptied the Logs panel.
     chunks = []
     while True:
-        c = s.recv(65536)
+        try:
+            c = s.recv(65536)
+        except socket.timeout:
+            break       # keep what arrived; a slow daemon must not hang the UI
         if not c:
             break
         chunks.append(c)
