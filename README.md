@@ -36,6 +36,15 @@ A minimal Docker stack for a USB-gadget Raspberry Pi that runs Pi-hole as the DN
   can roll back — see [ui/README.md](ui/README.md). Note: the ui container
   mounts the docker socket, which is root-equivalent on the host; the HTTP
   Basic password is the only boundary in front of it.
+- A gadget RX watchdog (`bin/gadget-watchdog.sh` +
+  `systemd/pi-tor-gadget-watchdog.service`) that re-initialises `g_ether`
+  when the tether is genuinely stalled on receive (two failed probes +
+  stationary `rx_packets` while `tx_packets` still moves, only when a host
+  is actually tethered, capped at 3 reloads/hour) — see
+  [Gadget RX watchdog](#gadget-rx-watchdog)
+- `bin/usb_host_profile` — the tethering host's companion script: one
+  static NetworkManager profile (`enx*,usb*` name-glob match) so a
+  re-enumeration never leaves the workstation dead
 - A host-side tether UI (`hostui/`) that runs on the tethered **workstation**
   (loopback only, stdlib, no build step): on/off toggle for the USB tether,
   a live status panel, and a dead-man revert that restores the host's normal
@@ -248,6 +257,78 @@ consecutive failures, logs the reason, and then stops probing until you
 re-enable the tether. State survives a UI restart (the session is re-armed
 from the state file); it does not survive a process that is down.
 
+## Gadget RX watchdog
+
+Measured on the device, the Pi Zero 2 W's USB gadget occasionally stalls
+**on receive**: the Pi keeps transmitting (its ARPs flow out, so
+`tx_packets` climbs) while `rx_packets` freezes and every probe dies, and
+the tethered machine goes dead even though reboots "fixed" it — they only
+re-initialised the gadget. Reloading the gadget module,
+`modprobe -r g_ether && modprobe g_ether`, restores RX within seconds.
+
+`bin/gadget-watchdog.sh` (installed as
+`systemd/pi-tor-gadget-watchdog.service`, POSIX `sh`, `Restart=always`)
+does exactly that, and **only that** when the conditions really hold:
+
+- It acts **only when a host is tethered**: the neighbour table must show
+  a link-layer address for `PI_TOR_HOST_ADDR` (default `10.12.194.2`), and
+  `usb0` (`PI_TOR_GADGET_IF`) must exist. No host, no gadget, no log line —
+  a healthy or idle tether produces **no output at all** (one startup
+  config line per service start).
+- Two independent signals must **both** agree across one probe window
+  before it reloads: the end-to-end probe (`ping -c1 -W1 $PI_TOR_HOST_ADDR`)
+  fails `WATCH_FAIL_THRESHOLD=2` times in a row (probes one
+  `WATCH_PROBE_INTERVAL=30` s apart), **and** `rx_packets` did not advance
+  across the window while `tx_packets` did. Either alone is not enough —
+  an idle-but-healthy host proves nothing by staying silent, and a host
+  firewall dropping pings proves nothing either.
+- Rate limiting: at most `WATCH_MAX_RELOADS_PER_HOUR=3` reloads per hour
+  window, with sleeps of 60 s / 180 s before the 2nd / 3rd attempt. The
+  cap bookkeeping persists to
+  `/var/lib/pi-tor-gadget-watchdog/state` so a restart cannot reset it;
+  past the cap it logs one loud line per window and reloads nothing until
+  the window clears. A reload is synchronous with the loop, so two
+  reloads can never overlap; after one it waits (bounded
+  `WATCH_RECOVER_SECONDS=20`) for `usb0` and `10.12.194.1`
+  (`PI_TOR_GATEWAY`) to return before probing again.
+- Every state change and decision is one `[gadget-watchdog]` line on
+  stdout (the journal) with the counters that justified it.
+
+All of it is fixture-testable (`ui/tests/test_watchdog.py`): counters,
+neighbour check, probe, reload and wait sources are injectable via
+`WATCH_SYSFS`, `WATCH_NEIGH_CMD`, `WATCH_PROBE_CMD`, `WATCH_RELOAD_CMD`,
+`WATCH_STATE_FILE`, `WATCH_FIB_TRIE`, `WATCH_MAX_CYCLES`.
+
+Install on the Pi:
+
+```bash
+sudo cp systemd/pi-tor-gadget-watchdog.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now pi-tor-gadget-watchdog
+```
+
+The unit deliberately does **not** wire the stack's `PI_TOR_INTERFACE` —
+the watchdog's own knobs are independent of the torrc rendering. Override
+them with `systemctl edit pi-tor-gadget-watchdog` if needed.
+
+### Host side: `bin/usb_host_profile`
+
+A reload re-enumerates the gadget, so on the tethered machine the interface
+returns with a **new name and no address** — and NetworkManager's
+auto-created "Wired connection N" then DHCP-polls forever and flushes
+static addresses, which produced hours of false "the Pi is dead"
+diagnoses. `bin/usb_host_profile` (run as root on the tethering host) is
+the companion step: it creates one static NM profile —
+`10.12.194.2/24` (`PI_TOR_HOST_ADDR`), no gateway, `ipv4.never-default
+yes`, empty DNS, autoconnect — that survives re-enumeration by matching
+`match.interface-name` globs `enx*,usb*` instead of any single interface
+name (the name *shape* is stable across renames; a driver match is not,
+because the host-side gadget driver varies: cdc_ether, cdc_ncm, rndis_host,
+eem). Requires NetworkManager >= 1.14. `--dry-run` prints the exact
+`nmcli` commands without changing anything; it refuses to run when a
+profile named `pi-tor-gadget` already exists unless `--force`
+(delete + re-add); `--remove` takes the profile back out.
+
 ## Diagnostics
 
 Run `./collect_pi_support.sh` to capture system state, docker details,
@@ -266,6 +347,9 @@ bin/uplink-check.sh        # tor-side uplink gate (IPv4 lease + default route)
 bin/usb_route[, _undo]     # host-side tether toggle + saved-state undo
 hostui/                    # host tether UI: app.py + pi-tor-hostui.service
 systemd/                   # optional stack unit + env example
+bin/gadget-watchdog.sh     # Pi-side g_ether RX-stall watchdog (reloads only
+                           # on a confirmed stall, capped 3/hour)
+bin/usb_host_profile       # host-side static NM profile across re-enumerations
 collect_pi_support.sh      # diagnostics helper
 ```
 

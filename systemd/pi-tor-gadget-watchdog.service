@@ -1,0 +1,20 @@
+[Unit]
+Description=pi-tor gadget RX watchdog (reload g_ether when the USB tether stalls on receive)
+Documentation=https://github.com/winslowb/pi-tor#readme
+
+[Service]
+Type=simple
+# Runs on the Pi, as root (the reload is a modprobe). Config comes from
+# script defaults; override knobs with a drop-in, e.g.
+#   systemctl edit pi-tor-gadget-watchdog
+#   [Service]
+#   Environment=PI_TOR_HOST_ADDR=10.12.194.2
+# Deliberately does NOT source /etc/default/pi-tor: the watchdog's own
+# vars (PI_TOR_GADGET_IF, PI_TOR_HOST_ADDR, PI_TOR_GATEWAY) are set
+# independently of the docker stacks' PI_TOR_INTERFACE.
+ExecStart=/opt/pi-tor/bin/gadget-watchdog.sh
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
