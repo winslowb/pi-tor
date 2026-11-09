@@ -49,7 +49,8 @@ A minimal Docker stack for a USB-gadget Raspberry Pi that runs Pi-hole as the DN
   (loopback only, stdlib, no build step): on/off toggle for the USB tether,
   a live status panel, and a dead-man revert that restores the host's normal
   routing when the Pi stops answering — see below
-- A diagnostic bundle script (`collect_pi_support.sh`) for quick triage
+- Two generated diagrams in [`doc/diagrams/`](doc/diagrams/) — the traffic
+  path + control plane, and one real request end to end (see [Diagrams](#diagrams))
 
 ## Requirements
 
@@ -169,6 +170,67 @@ boot; the ui container inside it applies the firewall rules. For a manual
 run of the rules themselves (e.g. flushing after a `compose down`),
 `bin/pi-tor-rules.sh apply|flush|show-rules` remains the single
 implementation — run it with `sudo` when the stack is not up.
+
+## Config UI (ui/) — the stack edited from a browser
+
+`ui/` is a third compose service on the Pi, at `http://10.12.194.1:8080`
+(HTTP Basic, user `pi-tor`, password from `PI_TOR_UI_PASSWORD` in `.env`).
+It exists because the same four values — gadget subnet/gateway, interface,
+ports, timezone/password — are duplicated across `tor/torrc`, four
+`pihole/etc-dnsmasq.d/*.conf` files, `bin/pi-tor-rules.sh` and `.env`. Editing
+one by hand leaves tor unable to bind `10.12.194.1:9040` while dnsmasq keeps
+listening on a stale address, and both fail silently.
+
+- **One schema, every file.** `ui/config_schema.py` holds the knobs;
+  `ui/render.py` writes each config file from them. Rendering the defaults
+  reproduces the committed files byte for byte, so a no-op save changes
+  nothing.
+- **Preview → apply, with a rollback.** `/api/preview` returns the per-file
+  diff and writes nothing. Apply backs up, writes, restarts only the
+  containers whose files changed, and reads health back.
+- **It owns the firewall.** The container has `cap_add: [NET_ADMIN, NET_RAW]`
+  and calls `bin/pi-tor-rules.sh` itself on start and on demand, so there is
+  no host `sudo` and no rules unit. It refuses an apply whose protected hosts
+  omit the gateway — that would lock you out of SSH, Pi-hole and the UI at once.
+- **Logs panel.** The `tor` and `pihole` buttons tail the containers over the
+  docker socket; the response is a Docker multiplexed stream, demuxed in
+  `ui/dockerops.py`.
+- **Dry run.** `PI_TOR_UI_DRY_RUN=1` renders and previews without writing or
+  executing anything — how it was tested before the device saw it.
+- Tests: `python3 -m unittest discover -s ui/tests` (88 tests, stdlib only).
+  Details in [ui/README.md](ui/README.md).
+
+**Security boundary, stated plainly:** the ui container mounts
+`/var/run/docker.sock`, which is root-equivalent on the host. HTTP Basic with
+one shared password is the only thing in front of it. Bind it to the gadget
+subnet and loopback and nothing else.
+
+## Measured performance
+
+On a Pi Zero 2 W (4×A53, 425 MB) with the tether up, through Tor:
+
+| measure | value |
+|---|---|
+| throughput, one connection | 380–480 KB/s (10 MB in 21–26 s) |
+| page load | example.com 1.59 s total; connect to tor's TransPort 5.9 ms |
+| QUIC (UDP 443) | dropped 5/5 — by design, see the UDP rule above |
+
+One person browsing is comfortable; two is slow; five is not. Video is out of
+reach. The Pi's CPU and Tor's circuit setup are the bottleneck, not the USB
+link.
+
+## Diagrams
+
+Both are generated from `candidate.json` sources with
+[archify](https://github.com/tt-a1i/archify) and committed as self-contained
+HTML — open them in any browser, no server needed.
+
+- [`doc/diagrams/pi-tor-architecture.html`](doc/diagrams/pi-tor-architecture.html)
+  — the traffic path (DNS to Pi-hole, all TCP into tor) plus the control plane,
+  with the boundaries that matter. Source: `pi-tor-architecture.candidate.json`.
+- [`doc/diagrams/pi-tor-sequence.html`](doc/diagrams/pi-tor-sequence.html)
+  — one real request: DNS resolve, redirect, circuit, response, with the
+  timings measured above. Source: `pi-tor-sequence.candidate.json`.
 
 ## Host tether UI (hostui/) — browser toggle + dead-man revert
 
@@ -385,8 +447,16 @@ profile named `pi-tor-gadget` already exists unless `--force`
 
 ## Diagnostics
 
-Run `./collect_pi_support.sh` to capture system state, docker details,
-Pi-hole dumps, Tor status, and networking info into `support/` for sharing.
+There is no bundled support script. The useful checks are:
+
+```bash
+docker ps                                   # three containers, all Up
+docker logs pi-tor-ui | grep -i "applying firewall"   # rules applied at start
+sudo bin/pi-tor-rules.sh show-rules         # nat + filter, in apply order, no change
+curl --socks5-hostname 10.12.194.1:9050 https://api.ipify.org   # a Tor exit IP?
+dig @10.12.194.1 example.com                # Pi-hole answering over the tether
+sudo modprobe -r g_ether && sudo modprobe g_ether   # only for a genuine RX stall
+```
 
 ## Repository layout
 
@@ -395,6 +465,7 @@ docker-compose.yml         # Tor + Pi-hole + config-UI stack
 pihole/etc-dnsmasq.d/      # Pi-hole dnsmasq overrides (tracked)
 pihole/etc-pihole/.gitkeep # bind mount placeholder (data ignored)
 tor/                       # Dockerfile + torrc + data dir placeholder
+ui/                        # config UI service: schema -> render -> apply
 bin/pi-tor-rules.sh        # iptables helper (apply|flush|show-rules),
                            # executed by the ui container, sudo for manual runs
 bin/uplink-check.sh        # tor-side uplink gate (IPv4 lease + default route)
@@ -404,8 +475,38 @@ systemd/                   # optional stack unit + env example
 bin/gadget-watchdog.sh     # Pi-side g_ether RX-stall watchdog (reloads only
                            # on a confirmed stall, capped 3/hour)
 bin/usb_host_profile       # host-side static NM profile across re-enumerations
-collect_pi_support.sh      # diagnostics helper
+doc/diagrams/              # generated architecture + sequence plates
 ```
+
+## Known gotchas
+
+Each of these cost a live debugging session; they are not hypothetical.
+
+- **Scripts must be executable in git, not just on disk.** `usb_route` and
+  `usb_route_undo` once shipped mode 644, so every fresh clone failed
+  `sudo <script>` with `command not found` while the tests passed — they
+  invoke `bash bin/usb_route`, which does not need the bit. `git
+  update-index --chmod=+x <path>`.
+- **`set -o pipefail` plus `| head -n1` or `| grep -q` is fatal.** The
+  consumer exits early, the producer takes SIGPIPE, the pipeline returns 141
+  and `set -e` kills the script — and it only triggers once the output has a
+  second line, which is exactly what the tether creates. Use
+  `sed -n '1p'` or capture into a variable.
+- **NetworkManager owns the gadget address.** The `pi-tor-gadget` profile
+  assigns `10.12.194.2/24`, so a script that flushes and re-adds it fails
+  with `Address already assigned`. Assign only what is missing.
+- **Under `sudo`, `HOME` is `/root`.** The tether snapshot lands in root's
+  state directory and the user's undo then looks at a different file. Both
+  scripts resolve the state dir from `SUDO_USER`.
+- **Never half-close a request to the Docker socket.** `shutdown(SHUT_WR)`
+  before reading makes Docker's Go server treat it as a client abort:
+  `/containers/<name>/logs` answers 200 with an **empty body** and
+  `/version` answers 500. That is what kept the Logs panel blank.
+- **The gadget's RX can stall without dying.** `rx_packets` in single digits
+  while `tx_packets` climbs means a driver stall, not a bad cable or power:
+  `modprobe -r g_ether && modprobe g_ether` on the Pi. The host side also
+  loses its address on every re-enumeration — that is what
+  `bin/usb_host_profile` is for.
 
 ## Planned updates
 I'll add TailScale at some point.

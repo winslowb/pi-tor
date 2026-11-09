@@ -1,0 +1,158 @@
+{
+  "schema_version": 1,
+  "diagram_type": "sequence",
+  "meta": {
+    "title": "One request through pi-tor \u2014 DNS, then every TCP byte into tor",
+    "output": ".archify/sequence-pi-tor-20261108/pi-tor-sequence.html",
+    "quality_profile": "showcase",
+    "repository": {
+      "url": "https://github.com/winslowb/pi-tor",
+      "provider": "github",
+      "revision": "0cf28c965286a197a09908cfb2f780725430bd0c"
+    }
+  },
+  "participants": [
+    {
+      "id": "host",
+      "type": "external",
+      "label": "Host",
+      "sublabel": "curl -4 \u00b7 10.12.194.2"
+    },
+    {
+      "id": "pihole",
+      "type": "backend",
+      "label": "Pi-hole",
+      "sublabel": "usb0 :53",
+      "sources": [
+        {
+          "path": "pihole/etc-dnsmasq.d/02-listen.conf"
+        }
+      ]
+    },
+    {
+      "id": "rules",
+      "type": "security",
+      "label": "iptables",
+      "sublabel": "REDIRECT chain",
+      "sources": [
+        {
+          "path": "bin/pi-tor-rules.sh"
+        }
+      ]
+    },
+    {
+      "id": "tor",
+      "type": "backend",
+      "label": "tor",
+      "sublabel": "TransPort :9040",
+      "sources": [
+        {
+          "path": "tor/torrc"
+        }
+      ]
+    },
+    {
+      "id": "relay",
+      "type": "external",
+      "label": "Tor circuit",
+      "sublabel": "3 hops"
+    },
+    {
+      "id": "site",
+      "type": "external",
+      "label": "icanhazip.com",
+      "sublabel": "the destination"
+    }
+  ],
+  "segments": [
+    {
+      "from": 150,
+      "to": 210,
+      "label": "resolve via Pi-hole"
+    },
+    {
+      "from": 220,
+      "to": 300,
+      "label": "redirect \u00b7 connect 5.9 ms"
+    },
+    {
+      "from": 310,
+      "to": 420,
+      "label": "1.59 s end to end"
+    }
+  ],
+  "messages": [
+    {
+      "id": "dns-query",
+      "from": "host",
+      "to": "pihole",
+      "y": 165,
+      "label": "A? icanhazip.com",
+      "variant": "emphasis"
+    },
+    {
+      "id": "dns-answer",
+      "from": "pihole",
+      "to": "host",
+      "y": 195,
+      "label": "rcode 0 \u00b7 1 A record",
+      "variant": "return"
+    },
+    {
+      "id": "syn",
+      "from": "host",
+      "to": "rules",
+      "y": 225,
+      "label": "TCP SYN :443",
+      "variant": "emphasis"
+    },
+    {
+      "id": "redirect",
+      "from": "rules",
+      "to": "tor",
+      "y": 255,
+      "label": "REDIRECT \u2192 10.12.194.1:9040",
+      "variant": "emphasis"
+    },
+    {
+      "id": "circuit",
+      "from": "tor",
+      "to": "relay",
+      "y": 285,
+      "label": "3-hop circuit, TLS",
+      "variant": "security"
+    },
+    {
+      "id": "get",
+      "from": "relay",
+      "to": "site",
+      "y": 315,
+      "label": "GET /",
+      "variant": "default"
+    },
+    {
+      "id": "body",
+      "from": "site",
+      "to": "relay",
+      "y": 345,
+      "label": "200 \u00b7 seen as 23.137.105.248",
+      "variant": "return"
+    },
+    {
+      "id": "back",
+      "from": "relay",
+      "to": "tor",
+      "y": 375,
+      "label": "response bytes",
+      "variant": "return"
+    },
+    {
+      "id": "delivered",
+      "from": "tor",
+      "to": "host",
+      "y": 405,
+      "label": "delivered \u00b7 1.59 s total",
+      "variant": "return"
+    }
+  ]
+}

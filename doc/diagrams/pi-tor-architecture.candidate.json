@@ -1,0 +1,277 @@
+{
+  "schema_version": 1,
+  "diagram_type": "architecture",
+  "meta": {
+    "title": "pi-tor \u2014 one stack, two traffic paths and a control plane",
+    "output": ".archify/architecture-pi-tor-20261108/pi-tor-architecture.html",
+    "quality_profile": "showcase",
+    "repository": {
+      "url": "https://github.com/winslowb/pi-tor",
+      "provider": "github",
+      "revision": "0cf28c965286a197a09908cfb2f780725430bd0c"
+    }
+  },
+  "components": [
+    {
+      "id": "host",
+      "type": "external",
+      "label": "Tethering host",
+      "sublabel": "10.12.194.2 \u00b7 any laptop",
+      "pos": [
+        40,
+        96
+      ],
+      "size": [
+        150,
+        64
+      ],
+      "sources": [
+        {
+          "path": "bin/usb_host_profile"
+        }
+      ]
+    },
+    {
+      "id": "rules",
+      "type": "security",
+      "label": "iptables",
+      "sublabel": "REDIRECT chain",
+      "pos": [
+        256,
+        96
+      ],
+      "size": [
+        140,
+        64
+      ],
+      "sources": [
+        {
+          "path": "bin/pi-tor-rules.sh"
+        }
+      ]
+    },
+    {
+      "id": "tor",
+      "type": "backend",
+      "label": "tor 0.4.9",
+      "sublabel": "TransPort 9040 \u00b7 DNSPort 5353",
+      "pos": [
+        508,
+        96
+      ],
+      "size": [
+        190,
+        64
+      ],
+      "sources": [
+        {
+          "path": "tor/torrc"
+        }
+      ]
+    },
+    {
+      "id": "relay",
+      "type": "external",
+      "label": "Tor network",
+      "sublabel": "3 hops \u00b7 exit relay",
+      "pos": [
+        791,
+        96
+      ],
+      "size": [
+        150,
+        64
+      ]
+    },
+    {
+      "id": "site",
+      "type": "external",
+      "label": "Destination",
+      "sublabel": "any HTTPS site",
+      "pos": [
+        995,
+        96
+      ],
+      "size": [
+        140,
+        64
+      ]
+    },
+    {
+      "id": "pihole",
+      "type": "backend",
+      "label": "Pi-hole",
+      "sublabel": "DNS edge \u00b7 usb0 :53",
+      "pos": [
+        246,
+        300
+      ],
+      "size": [
+        150,
+        64
+      ],
+      "sources": [
+        {
+          "path": "pihole/etc-dnsmasq.d/02-listen.conf"
+        },
+        {
+          "path": "pihole/etc-dnsmasq.d/02-upstream-tor.conf"
+        }
+      ]
+    },
+    {
+      "id": "ui",
+      "type": "frontend",
+      "label": "Config UI",
+      "sublabel": ":8080 \u00b7 render + apply",
+      "pos": [
+        520,
+        300
+      ],
+      "size": [
+        190,
+        64
+      ],
+      "sources": [
+        {
+          "path": "ui/app.py"
+        },
+        {
+          "path": "ui/render.py"
+        }
+      ]
+    },
+    {
+      "id": "sock",
+      "type": "database",
+      "label": "docker.sock",
+      "sublabel": "root-equivalent access",
+      "pos": [
+        796,
+        300
+      ],
+      "size": [
+        150,
+        64
+      ],
+      "sources": [
+        {
+          "path": "docker-compose.yml"
+        }
+      ]
+    },
+    {
+      "id": "hostui",
+      "type": "frontend",
+      "label": "Tether UI",
+      "sublabel": ":8090 \u00b7 toggle + dead-man",
+      "pos": [
+        40,
+        300
+      ],
+      "size": [
+        150,
+        64
+      ],
+      "sources": [
+        {
+          "path": "hostui/app.py"
+        }
+      ]
+    }
+  ],
+  "boundaries": [
+    {
+      "kind": "security-group",
+      "label": "Pi Zero 2 W \u00b7 host network",
+      "wraps": [
+        "rules",
+        "tor",
+        "pihole",
+        "ui"
+      ],
+      "pad": 22
+    }
+  ],
+  "connections": [
+    {
+      "from": "host",
+      "to": "rules",
+      "label": "all TCP",
+      "variant": "emphasis"
+    },
+    {
+      "from": "host",
+      "to": "pihole",
+      "label": "DNS :53",
+      "variant": "emphasis"
+    },
+    {
+      "from": "rules",
+      "to": "tor",
+      "label": "REDIRECT :9040",
+      "variant": "emphasis"
+    },
+    {
+      "from": "pihole",
+      "to": "tor",
+      "label": "upstream :5353",
+      "variant": "default"
+    },
+    {
+      "from": "tor",
+      "to": "relay",
+      "label": "TLS circuit",
+      "variant": "security"
+    },
+    {
+      "from": "relay",
+      "to": "site",
+      "label": "HTTPS",
+      "variant": "default"
+    },
+    {
+      "from": "ui",
+      "to": "tor",
+      "label": "renders torrc",
+      "variant": "dashed"
+    },
+    {
+      "from": "ui",
+      "to": "sock",
+      "label": "docker API",
+      "variant": "security"
+    },
+    {
+      "from": "hostui",
+      "to": "host",
+      "label": "route + DNS",
+      "variant": "dashed"
+    }
+  ],
+  "cards": [
+    {
+      "dot": "orange",
+      "title": "Two paths, one dial",
+      "items": [
+        "Everything the tethered host sends arrives on usb0. DNS is rewritten to Pi-hole, which forwards to tor's DNSPort; all other TCP is REDIRECTed into TransPort.",
+        "Nothing is masqueraded \u2014 the Pi is not a general router."
+      ]
+    },
+    {
+      "dot": "rose",
+      "title": "The gap this closes",
+      "items": [
+        "Non-DNS UDP is dropped on usb0, so QUIC cannot slip out of the hostile network the host is trying to leave. Measured: 5 of 5 datagrams to 8.8.8.8:443 dropped."
+      ]
+    },
+    {
+      "dot": "violet",
+      "title": "Control plane is separate",
+      "items": [
+        "The Config UI renders the same values into torrc, four dnsmasq files, the rules env and .env, then restarts only what changed.",
+        "The Tether UI lives on the host: a browser there cannot reach 10.12.194.1 before it holds an address on the link."
+      ]
+    }
+  ]
+}
