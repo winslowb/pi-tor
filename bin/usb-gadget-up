@@ -3,9 +3,11 @@
 #
 # The Raspberry Pi path uses the legacy g_ether module, which the kernel
 # creates from config.txt (`dtoverlay=dwc2,dr_mode=peripheral`). A Radxa Zero
-# (Armbian, meson64) has no g_ether autoload: configfs is mounted, the UDC
-# (/sys/class/udc/ff400000.usb) sits idle and `usb0` never appears. This
-# script composes the gadget on configfs instead — one ECM function with
+# (Armbian, meson64) has g_ether present and loadable (CONFIG_USB_ETH=m) but
+# nothing autoloads it and there is no config.txt overlay, so it has no gadget
+# to bind and `usb0` never appears. This script composes the gadget on
+# configfs instead — the path this kernel supports and the one whose
+# re-enumeration the watchdog can drive — with one ECM function named
 # ifname=usb0, so every existing config (dnsmasq `interface=usb0`, the
 # 10.12.194.1 torrc binds, the firewall rules) keeps working unchanged.
 # Deliberately no HID, mass-storage or other functions: this is a gateway,
@@ -59,7 +61,10 @@ case "$prefix" in '' | *[!0-9]*) prefix=24 ;; esac
 
 networkd_conf() {
   [ -d "$NETWORKD_DIR" ] || return 0
-  printf '[Match]\nName=%s\n\n[Network]\nAddress=%s/%s\nLinkLocalAddressing=no\nIPv6AcceptRA=no\n' \
+  # ConfigureWithoutCarrier: u_ether keeps carrier off until the USB host
+  # selects the ECM data altsetting, and networkd would otherwise never
+  # address the link.
+  printf '[Match]\nName=%s\n\n[Network]\nAddress=%s/%s\nConfigureWithoutCarrier=yes\nLinkLocalAddressing=no\nIPv6AcceptRA=no\n' \
     "$IF" "$GW" "$prefix" > "$NW" || die "cannot write $NW"
   if command -v "$NETWORKCTL" >/dev/null 2>&1; then
     "$NETWORKCTL" reload >/dev/null 2>&1 || log "WARNING: $NETWORKCTL reload failed; $IF may stay unaddressed"
@@ -95,7 +100,11 @@ up() {
     printf 'pi-tor ECM gateway' > "$G/strings/0x409/product" || die "cannot write strings"
     printf 'pi-tor' > "$G/strings/0x409/serialnumber" || die "cannot write strings"
     mkdir -p "$F" || die "cannot create ECM function $F"
-    attr "$F/ifname" "$IF"         # the name every existing config assumes
+    # configfs rejects ifname with -EBUSY while the function is referenced,
+    # and a gadget that was only unbound still has it: keep the name it got.
+    if [ ! -e "$F/ifname" ]; then
+      attr "$F/ifname" "$IF"       # the name every existing config assumes
+    fi
     [ -e "$G/configs/c.1/ecm.$IF" ] || ln -s "$F" "$G/configs/c.1/ecm.$IF" ||
       die "cannot link ECM function into c.1"
     attr "$G/configs/c.1/MaxPower" 250   # same advertised draw as g_ether
@@ -107,7 +116,7 @@ up() {
     networkd_conf
   fi
   net_wait || die "$IF did not appear within ${WAIT}s; check dmesg for the UDC bind"
-  log "ready: $IF carries $GW on $SUBNET once networkd applies $NW"
+  log "ready: $IF exists; $GW/$prefix is set for when the host attaches ($NW)"
 }
 
 down() {
@@ -117,14 +126,28 @@ down() {
       printf '\n' > "$G/UDC" || die "cannot unbind $u"
       log "unbound $u"
     fi
-    rm -f "$G/configs/c.1/ecm.$IF"
-    rmdir "$G/functions/ecm.$IF" "$G/configs/c.1" "$G/strings/0x409" "$G" 2>/dev/null
-    [ -e "$G" ] && log "WARNING: $G survived removal (a bound function blocks it)"
+    # Remove what is actually linked, not `ecm.$IF`: PI_TOR_INTERFACE may have
+    # changed since composition, and configfs refuses to drop a referenced
+    # function, which would then block every remaining rmdir.
+    for link in "$G"/configs/c.1/ecm.*; do
+      [ -e "$link" ] || [ -L "$link" ] || continue
+      rm -f "$link" || die "cannot unlink $link"
+    done
+    for fn in "$G"/functions/ecm.*; do
+      [ -d "$fn" ] || continue
+      rmdir "$fn" || log "WARNING: cannot remove $fn"
+    done
+    # children before parents; configfs will not drop a non-empty directory
+    rmdir "$G/configs/c.1" "$G/configs" "$G/strings/0x409" "$G/strings" \
+      "$G/functions" "$G" 2>/dev/null
   fi
   rm -f "$NW"
   if command -v "$NETWORKCTL" >/dev/null 2>&1; then
     "$NETWORKCTL" reload >/dev/null 2>&1 || true
   fi
+  # Never report success over a gadget left behind: `up` and the watchdog
+  # would inherit it.
+  [ -e "$G" ] && die "teardown incomplete: $G still exists (leftover function or symlink)"
   log "gadget down"
   return 0
 }
@@ -135,7 +158,9 @@ rebind() {
   udc=$(cat "$G/UDC")
   log "unbinding $udc to re-enumerate"
   printf '\n' > "$G/UDC" || die "cannot unbind $udc"
+  sleep 1   # the legacy reload's settle; the UDC needs to see the disconnect
   attr "$G/UDC" "$udc"
+  networkd_conf
   log "rebound $udc on $IF"
   net_wait || log "WARNING: $IF did not return within ${WAIT}s"
 }

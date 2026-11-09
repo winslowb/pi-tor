@@ -84,9 +84,6 @@ edns-packet-max={cfg['edns_packet_max']}
 # EnvironmentFile=) to override defaults used by the provided systemd units
 # and helper scripts.
 
-# Absolute path to the cloned repo
-PROJECT_DIR=/opt/pi-tor
-
 # USB gadget interface + addressing used for the workstation tether
 PI_TOR_INTERFACE={cfg['interface']}
 PI_TOR_SUBNET={cfg['subnet']}

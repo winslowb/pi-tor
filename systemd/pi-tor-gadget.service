@@ -1,7 +1,8 @@
 [Unit]
 Description=pi-tor USB gadget (configfs CDC ECM) on the gadget port
 Documentation=https://github.com/winslowb/pi-tor#radxa-zero-arm64
-# usb-gadget.target is systemd's "the USB gadget stack is ready" point; the
+# usb-gadget.target marks the UDC hardware being present (WantedBy
+# sys-devices-...-udc-*.device); the gadget itself is composed here. The
 # stack unit is ordered after this one so tor never races the interface.
 After=usb-gadget.target
 Before=pi-tor-stack.service

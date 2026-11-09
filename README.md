@@ -169,7 +169,7 @@ the stack come up on boot:
    sudo systemctl enable --now pi-tor-stack.service
    ```
 
-`pi-tor-stack` runs `docker compose up -d --build` from `PROJECT_DIR` on
+`pi-tor-stack` runs `docker compose up -d --build` from `/opt/pi-tor` on
 boot; the ui container inside it applies the firewall rules. For a manual
 run of the rules themselves (e.g. flushing after a `compose down`),
 `bin/pi-tor-rules.sh apply|flush|show-rules` remains the single
@@ -237,49 +237,80 @@ HTML — open them in any browser, no server needed.
   timings measured above. Source: `pi-tor-sequence.candidate.json`.
 ## Radxa Zero (ARM64)
 
-The same stack runs on a Radxa Zero (Armbian 26.x, `aarch64`, meson64 kernel)
-with one extra bring-up step. There is no `config.txt` overlay and no
-`g_ether` autoload, so `usb0` never appears on its own: the gadget is composed
-on configfs by `bin/usb-gadget-up` (`systemd/pi-tor-gadget.service`). It
-creates **one CDC ECM function** named `ifname=usb0` — no HID, no mass
-storage — so every existing config (`interface=usb0`, the `10.12.194.1`
-torrc binds, the firewall rules) works unchanged.
+**Port groundwork, not a deployed stack.** The gadget side below works with
+the existing configs, but the board has no Docker Engine, so no container
+runs there yet. Nothing in this repo installs anything on the board.
 
-Verified read-only on the board (nothing in this repo installs any of it):
+A Radxa Zero (Armbian 26.x, `aarch64`, meson64 kernel) has no `config.txt`
+overlay, and `g_ether` — although present and loadable (`CONFIG_USB_ETH=m`;
+`modprobe -n -v g_ether` resolves `libcomposite`, `u_ether`, `usb_f_rndis`
+and `g_ether.ko`) — is not autoloaded and has no gadget to bind, so `usb0`
+never appears on its own. The gadget is composed on configfs instead by
+`bin/usb-gadget-up` (`systemd/pi-tor-gadget.service`): configfs is the path
+this kernel supports, needs no device-tree overlay, and gives the watchdog a
+re-enumeration it can drive from a script. The script creates **one CDC ECM
+function** named `ifname=usb0` — no HID, no mass storage — so every existing
+config (`interface=usb0`, the `10.12.194.1` torrc binds, the firewall rules)
+works unchanged.
+
+Verified read-only on the board:
 
 - kernel already has `CONFIG_USB_CONFIGFS`, `CONFIG_USB_CONFIGFS_ECM`,
   `CONFIG_USB_F_ECM`, `CONFIG_USB_LIBCOMPOSITE`, `CONFIG_USB_DWC2=y`
   (DT `dr_mode=otg`, UDC `ff400000.usb` idle at `state=not attached`) and
   `CONFIG_NF_TABLES` / `CONFIG_IP_NF_NAT` for the iptables-nft rules the ui
   container applies
-- Docker Engine 24+ with the compose plugin is **not installed** — the ui
-  service bind-mounts `/usr/bin/docker` and `/usr/libexec/docker/cli-plugins`,
-  so fix those two volumes if your install puts them elsewhere
 - `node_exporter.service` keeps `:9100`; this stack never binds it (9050,
   9040, 5353, 53, 80, 8080)
 - addressing stays with netplan/networkd: `up` writes a runtime-only
   `/run/systemd/network/10-pi-tor-usb0.network` built from
   `PI_TOR_GATEWAY`/`PI_TOR_SUBNET`, so no `/etc` edit and no second copy of
-  the gateway value
+  the gateway value. That file sets `ConfigureWithoutCarrier=yes`: u_ether
+  keeps carrier off until the USB host selects the ECM data altsetting, and
+  networkd would otherwise never address the link
 
-Both units expect the checkout at `/opt/pi-tor`.
+### Before the stack can run here
+
+`docker compose` does not run on this board today — Docker is absent and
+`/opt` holds no checkout. Needed first:
+
+1. Docker Engine 24+ and the Compose v2 plugin, from Docker's official arm64
+   apt repository (or the `get.docker.com` script); confirm with
+   `docker compose version`. The ui service bind-mounts `/usr/bin/docker` and
+   `/usr/libexec/docker/cli-plugins`, so adjust those two volumes if the
+   install puts them elsewhere.
+2. The checkout at `/opt/pi-tor` — both units carry literal `/opt/pi-tor`
+   paths, because systemd cannot expand a variable into a path.
+
+The gadget can be brought up and used without either step:
 
 ```bash
 sudo cp systemd/pi-tor-gadget.service /etc/systemd/system/
 sudo systemctl daemon-reload
-sudo systemctl enable pi-tor-gadget pi-tor-stack
+sudo systemctl enable --now pi-tor-gadget.service
 bin/usb-gadget-up status        # udc=ff400000.usb ifname=usb0 net=up
 ```
 
-`pi-tor-gadget` is ordered `After=usb-gadget.target` and
-`Before=pi-tor-stack.service` (the stack unit is also `After=pi-tor-gadget`),
-so tor's gadget-address bind wait never races the interface. `up` is
-idempotent, `down` unbinds the UDC before removing anything, and
-`bin/usb-gadget-up rebind` unbinds + rebinds for a manual re-enumeration.
+`pi-tor-gadget` is ordered `After=usb-gadget.target` (the target marks the
+UDC hardware being present) and `Before=pi-tor-stack.service`. The stack unit
+carries `Wants=pi-tor-gadget.service` as well as `After=`, so enabling only
+the stack still starts the gadget; `Wants` rather than `Requires` means a
+gadget failure is logged instead of holding the stack back, and the UI then
+explains the missing tether.
 
-The RX-stall cure in the watchdog chapter is `modprobe -r g_ether`, which does
-not exist here. Install the rebind drop-in instead, so a confirmed stall
-re-enumerates the configfs gadget:
+`up` is idempotent even over a partially torn-down gadget: an unbound but
+composed one is reused, and `ifname` is not rewritten (configfs refuses that
+write while the function is linked). `down` removes whichever ECM function is
+actually linked — `PI_TOR_INTERFACE` may have changed since composition — and
+exits nonzero if any gadget state survives, so a failed teardown is never
+reported as success. `bin/usb-gadget-up rebind` rewrites the runtime networkd
+file and settles for a second between unbind and bind, matching the legacy
+reload.
+
+`up` only proves the netdev exists; the address needs the host. The RX-stall
+cure in the watchdog chapter is `modprobe -r g_ether && modprobe g_ether`;
+`g_ether` is loadable here, but the gadget is the configfs one, so install the
+rebind drop-in instead so a confirmed stall re-enumerates it:
 
 ```bash
 sudo cp -r systemd/pi-tor-gadget-watchdog.service.d /etc/systemd/system/
@@ -287,11 +318,14 @@ sudo systemctl daemon-reload && sudo systemctl restart pi-tor-gadget-watchdog
 ```
 
 **Not verified on hardware** (this change made no device writes): whether the
-OTG port enumerates while a gadget is bound to that UDC, and whether a rebind
-clears a real RX stall the way a `g_ether` reload does. The UDC is registered
-and idle, which is the state a bind expects; if the port stays in host role
-when cabled, the board needs a `dr_mode=peripheral` device-tree overlay —
-none ships in `/boot/dtb/amlogic/overlay` today.
+OTG port enumerates while a gadget is bound to that UDC, whether ECM carrier
+comes up and the address lands when a host attaches, whether a real configfs
+teardown/rebind behaves as the script expects (the unit tests run against a
+fixture tree, not the kernel), and whether a rebind clears a real RX stall the
+way a `g_ether` reload does. The UDC is registered and idle, which is the
+state a bind expects; if the port stays in host role when cabled, the board
+needs a `dr_mode=peripheral` device-tree overlay — none ships in
+`/boot/dtb/amlogic/overlay` today.
 
 ## Host tether UI (hostui/) — browser toggle + dead-man revert
 

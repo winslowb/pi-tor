@@ -2,16 +2,18 @@
 
 The script runs under `sh` (dash) with a fixture configfs root, a fixture
 `/sys/class/udc` holding one UDC, a fixture `/sys/class/net` and stub
-`networkctl`/`modprobe` commands, so no gadget is really composed and no
-module is loaded. The fixture is a plain filesystem, which cannot model
-configfs dropping its own attribute files, so `down` is asserted on the
-actions that matter (unbind, unlink the function, drop the networkd file)
-rather than on the directory tree disappearing.
+`networkctl`/`modprobe`/`rmdir` commands, so no gadget is really composed and
+no module is loaded. The `rmdir` stub is a stand-in for two kernel behaviours
+the plain filesystem lacks: a directory's attribute files vanish with the
+directory, and a directory referenced by a bound gadget or by a config symlink
+refuses removal. That is a model, not the kernel: real EBUSY/carrier/teardown
+ordering still needs device verification.
 """
 import os
 import stat
 import subprocess
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -27,6 +29,36 @@ UDC = "ff400000.usb"
 STUB = """#!/bin/sh
 printf '%s %s\\n' "$(basename "$0")" "$*" >> "$GADGET_UP_TEST_CALLS"
 exit 0
+"""
+
+RMDIR_STUB = """#!/bin/sh
+# configfs stand-in: attribute files vanish with their directory, and neither a
+# bound gadget nor a function still linked into a config can be removed.
+for d in "$@"; do
+  case "$d" in
+    "$PI_TOR_GADGETFS"/*)
+      if [ -n "$(cat "$PI_TOR_TEST_UDC_FILE" 2>/dev/null)" ]; then
+        printf 'bound: cannot remove %s\\n' "$d" >&2
+        exit 1
+      fi
+      case "$d" in */functions/*)
+        for l in "$PI_TOR_GADGETFS"/*/configs/*/*; do
+          [ -L "$l" ] || continue
+          if [ "$(readlink -f "$l")" = "$(readlink -f "$d")" ]; then
+            printf 'referenced: cannot remove %s\\n' "$d" >&2
+            exit 1
+          fi
+        done ;;
+      esac
+      if [ "$d" = "$PI_TOR_TEST_RMDIR_FAIL" ]; then
+        printf 'injected failure: cannot remove %s\\n' "$d" >&2
+        exit 1
+      fi
+      rm -f "$d"/* 2>/dev/null
+      ;;
+  esac
+done
+exec /bin/rmdir "$@"
 """
 
 
@@ -51,6 +83,9 @@ class Case:
             p = stubbin / name
             p.write_text(STUB)
             p.chmod(p.stat().st_mode | stat.S_IEXEC)
+        rmdir = stubbin / "rmdir"
+        rmdir.write_text(RMDIR_STUB)
+        rmdir.chmod(rmdir.stat().st_mode | stat.S_IEXEC)
         self.calls_log = self.root / "calls.log"
         self.g = self.gadgetfs / "pi_tor"
         self.networkd_file = self.networkd / "10-pi-tor-usb0.network"
@@ -65,6 +100,8 @@ class Case:
             PI_TOR_NETWORKD_DIR=str(self.networkd),
             PI_TOR_MODPROBE=str(self.root / "stubbin" / "modprobe"),
             PI_TOR_GADGET_WAIT="1",
+            PI_TOR_TEST_UDC_FILE=str(self.g / "UDC"),
+            PI_TOR_TEST_RMDIR_FAIL="",
             GADGET_UP_TEST_CALLS=str(self.calls_log))
         env.update(over)
         return subprocess.run(["sh", str(SCRIPT), *args],
@@ -115,6 +152,7 @@ class GadgetUpTest(unittest.TestCase):
         self.assertEqual(case.networkd_file.read_text(),
                          "[Match]\nName=usb0\n\n"
                          "[Network]\nAddress=10.12.194.1/24\n"
+                         "ConfigureWithoutCarrier=yes\n"
                          "LinkLocalAddressing=no\nIPv6AcceptRA=no\n")
         self.assertIn("networkctl reload", case.calls())
 
@@ -133,20 +171,65 @@ class GadgetUpTest(unittest.TestCase):
         self.assertEqual(case.run("up").returncode, 0)
         res = case.run("down")
         self.assertEqual(res.returncode, 0, res.stderr)
-        self.assertEqual(case.attr("UDC").strip(), "")
         self.assertIn("[usb-gadget] unbound %s" % UDC, res.stdout)
-        self.assertFalse((case.g / "configs/c.1/ecm.usb0").exists())
+        # the fixture's rmdir stub refuses removal while UDC is set, so a
+        # gadget left composed here means down removed before unbinding
+        self.assertFalse(case.g.exists())
         self.assertFalse(case.networkd_file.exists())
         self.assertIn("[usb-gadget] gadget down", res.stdout)
 
-    def test_rebind_unbinds_then_rebinds(self):
+    def test_down_removes_the_linked_function_after_an_interface_change(self):
         case = Case()
         self.assertEqual(case.run("up").returncode, 0)
+        # PI_TOR_INTERFACE changed since composition: the real symlink is
+        # ecm.usb0, so removing ecm.$IF would leave the gadget stuck
+        res = case.run("down", PI_TOR_INTERFACE="usb9")
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertFalse((case.g / "configs/c.1/ecm.usb0").exists())
+        self.assertFalse(case.g.exists())
+
+    def test_down_fails_when_a_gadget_directory_survives(self):
+        case = Case()
+        self.assertEqual(case.run("up").returncode, 0)
+        res = case.run("down",
+                       PI_TOR_TEST_RMDIR_FAIL=str(case.g / "functions/ecm.usb0"))
+        self.assertNotEqual(res.returncode, 0)
+        self.assertIn("teardown incomplete", res.stderr)
+        self.assertNotIn("gadget down", res.stdout)
+        self.assertTrue((case.g / "functions/ecm.usb0").exists())
+        # the runtime address file still goes: it must not outlive the gadget
+        self.assertFalse(case.networkd_file.exists())
+
+    def test_up_recovers_from_an_unbound_partial_gadget(self):
+        case = Case()
+        self.assertEqual(case.run("up").returncode, 0)
+        # manual UDC unbind: composed, linked, function still referenced
+        (case.g / "UDC").write_text("\n")
+        # configfs rejects ifname with EBUSY here, so any write must fail
+        (case.g / "functions/ecm.usb0/ifname").chmod(0o444)
+        res = case.run("up")
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertEqual(case.attr("UDC"), UDC)
+        self.assertEqual(case.attr("functions/ecm.usb0/ifname"), "usb0")
+        self.assertEqual(case.functions(), ["ecm.usb0"])
+
+    def test_rebind_unbinds_then_rebinds_and_rewrites_the_address_file(self):
+        case = Case()
+        self.assertEqual(case.run("up").returncode, 0)
+        case.networkd_file.unlink()          # e.g. a networkd runtime cleanup
+        start = time.monotonic()
         res = case.run("rebind")
+        elapsed = time.monotonic() - start
         self.assertEqual(res.returncode, 0, res.stderr)
         self.assertIn("unbinding %s to re-enumerate" % UDC, res.stdout)
         self.assertIn("rebound %s on usb0" % UDC, res.stdout)
         self.assertEqual(case.attr("UDC"), UDC)
+        # settles between unbind and bind, like the legacy sleep 1
+        self.assertGreaterEqual(elapsed, 0.9)
+        # rebind is also the watchdog's recovery path: it must restore the
+        # runtime config, not just the UDC binding
+        self.assertIn("ConfigureWithoutCarrier=yes",
+                      case.networkd_file.read_text())
 
     def test_rebind_refuses_when_nothing_is_composed(self):
         case = Case()
@@ -190,11 +273,17 @@ class GadgetUnitTest(unittest.TestCase):
         # the node_exporter port belongs to that service alone
         self.assertNotIn("9100", text)
 
-    def test_stack_unit_is_ordered_after_the_gadget(self):
+    def test_stack_unit_is_ordered_after_and_wants_the_gadget(self):
         text = wired(STACK)
         self.assertIn("After=docker.service pi-tor-gadget.service", text)
+        # enabling only the stack must still start the gadget; Wants, not
+        # Requires, so a gadget failure does not hold the stack back
+        self.assertIn("Wants=pi-tor-gadget.service", text)
+        self.assertNotIn("Requires=pi-tor-gadget.service", text)
         # compose needs the project dir as cwd, and it must be a literal path
         self.assertIn("WorkingDirectory=/opt/pi-tor", text)
+        # PROJECT_DIR was dead once the literal path replaced ${PROJECT_DIR}
+        self.assertNotIn("PROJECT_DIR", text)
 
     def test_watchdog_drop_in_rebinds_instead_of_modprobing_g_ether(self):
         text = wired(DROPIN)
