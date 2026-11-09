@@ -180,8 +180,8 @@ implementation — run it with `sudo` when the stack is not up.
 `ui/` is a third compose service on the Pi, at `http://10.12.194.1:8080`
 (HTTP Basic, user `pi-tor`, password from `PI_TOR_UI_PASSWORD` in `.env`).
 It exists because the same four values — gadget subnet/gateway, interface,
-ports, timezone/password — are duplicated across `tor/torrc`, four
-`pihole/etc-dnsmasq.d/*.conf` files, `bin/pi-tor-rules.sh` and `.env`. Editing
+ports, timezone/password — are duplicated across `tor/torrc`, `.env`,
+`docker-compose.yml` and `bin/pi-tor-rules.sh`. Editing
 one by hand leaves tor unable to bind `10.12.194.1:9040` while dnsmasq keeps
 listening on a stale address, and both fail silently.
 
@@ -201,7 +201,7 @@ listening on a stale address, and both fail silently.
   `ui/dockerops.py`.
 - **Dry run.** `PI_TOR_UI_DRY_RUN=1` renders and previews without writing or
   executing anything — how it was tested before the device saw it.
-- Tests: `python3 -m unittest discover -s ui/tests` (88 tests, stdlib only).
+- Tests: `python3 -m unittest discover -s ui/tests` (119 tests, stdlib only).
   Details in [ui/README.md](ui/README.md).
 
 **Security boundary, stated plainly:** the ui container mounts
@@ -235,6 +235,7 @@ HTML — open them in any browser, no server needed.
 - [`doc/diagrams/pi-tor-sequence.html`](doc/diagrams/pi-tor-sequence.html)
   — one real request: DNS resolve, redirect, circuit, response, with the
   timings measured above. Source: `pi-tor-sequence.candidate.json`.
+
 ## Radxa Zero (ARM64)
 
 Deployed and verified on a Radxa Zero running Armbian 26.11 (Debian trixie,
