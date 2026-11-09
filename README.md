@@ -199,8 +199,9 @@ listening on a stale address, and both fail silently.
 - **Logs panel.** The `tor` and `pihole` buttons tail the containers over the
   docker socket; the response is a Docker multiplexed stream, demuxed in
   `ui/dockerops.py`.
-- **Dry run.** `PI_TOR_UI_DRY_RUN=1` renders and previews without writing or
-  executing anything — how it was tested before the device saw it.
+- **Dry run.** `PI_TOR_UI_DRY_RUN=1` skips Docker/socket/firewall actions, but
+  apply and rollback still write rendered files and backups; it is not a
+  no-write preview. Use `/api/preview` for a diff that writes nothing.
 - Tests: `python3 -m unittest discover -s ui/tests` (119 tests, stdlib only).
   Details in [ui/README.md](ui/README.md).
 
