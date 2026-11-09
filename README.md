@@ -392,9 +392,9 @@ applied once with `docker exec -i pihole pihole setpassword`; it persists in
 `/etc/pihole` across restarts (the entrypoint then logs `Password already set
 in config file`).
 
-That v6 fix is now deployed on the board (commit `6bb4752`, recreated with
-`docker compose up -d pihole`). `.env` feeds the supported keys: the password
-via `FTLCONF_webserver_api_password`, and the DNS policy via
+That v6 fix is now deployed on the board (commit `6bb4752`, applied with
+`docker compose up -d --build pihole ui`). Compose sets the supported keys:
+the password via `FTLCONF_webserver_api_password`, and the DNS policy via
 `FTLCONF_dns_listeningMode=SINGLE`, `FTLCONF_dns_interface`,
 `FTLCONF_dns_upstreams=127.0.0.1#<DNSPort>` and `FTLCONF_dns_queryLogging`
 (EDNS size goes through `FTLCONF_misc_dnsmasq_lines`).
@@ -417,7 +417,7 @@ ignored)` and `Assigning password by Environment Variable`, with no random
 password and no `8.8.8.8` fallback. Functionally: queries to the gadget address
 `10.12.194.1` returned real A records, a unique query to the board's LAN
 address `192.168.0.27` timed out from both the tether host and pihole.lan, and
-two 20-second `tcpdump` captures on the tether host's WAN interface, taken
+two 20-second `tcpdump` captures on rzero's uplink interface (`wlan0`), taken
 during fresh queries, saw zero packets to TCP/UDP 53 — no DNS leaves the board
 off the Tor path.
 
