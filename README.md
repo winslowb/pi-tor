@@ -300,12 +300,15 @@ explains the missing tether.
 
 `up` is idempotent even over a partially torn-down gadget: an unbound but
 composed one is reused, and `ifname` is not rewritten (configfs refuses that
-write while the function is linked). `down` removes whichever ECM function is
-actually linked — `PI_TOR_INTERFACE` may have changed since composition — and
+write while the function is linked). If `PI_TOR_INTERFACE` changed since
+composition, `up` refuses rather than add a second ECM function, and asks for
+`down` first. `down` removes whichever ECM function is actually linked —
+`PI_TOR_INTERFACE` may have changed since composition — and
 exits nonzero if any gadget state survives, so a failed teardown is never
 reported as success. `bin/usb-gadget-up rebind` rewrites the runtime networkd
 file and settles for a second between unbind and bind, matching the legacy
-reload.
+reload; it exits nonzero if the netdev does not return, so the watchdog never
+counts a failed re-enumeration as recovery.
 
 `up` only proves the netdev exists; the address needs the host. The RX-stall
 cure in the watchdog chapter is `modprobe -r g_ether && modprobe g_ether`;

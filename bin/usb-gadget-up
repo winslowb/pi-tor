@@ -99,6 +99,13 @@ up() {
     printf 'pi-tor' > "$G/strings/0x409/manufacturer" || die "cannot write strings"
     printf 'pi-tor ECM gateway' > "$G/strings/0x409/product" || die "cannot write strings"
     printf 'pi-tor' > "$G/strings/0x409/serialnumber" || die "cannot write strings"
+    # A changed PI_TOR_INTERFACE would add a second ECM function and split the
+    # gateway from dnsmasq, so refuse and let the operator tear the old one down.
+    for fn in "$G"/functions/ecm.*; do
+      [ -d "$fn" ] || continue
+      [ "${fn##*/}" = "ecm.$IF" ] ||
+        die "existing ${fn##*/} does not match $IF: run '${0##*/} down' first"
+    done
     mkdir -p "$F" || die "cannot create ECM function $F"
     # configfs rejects ifname with -EBUSY while the function is referenced,
     # and a gadget that was only unbound still has it: keep the name it got.
@@ -161,8 +168,8 @@ rebind() {
   sleep 1   # the legacy reload's settle; the UDC needs to see the disconnect
   attr "$G/UDC" "$udc"
   networkd_conf
+  net_wait || die "rebind failed: $IF did not appear within ${WAIT}s after re-enumerating $udc"
   log "rebound $udc on $IF"
-  net_wait || log "WARNING: $IF did not return within ${WAIT}s"
 }
 
 status() {

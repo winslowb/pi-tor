@@ -213,6 +213,21 @@ class GadgetUpTest(unittest.TestCase):
         self.assertEqual(case.attr("functions/ecm.usb0/ifname"), "usb0")
         self.assertEqual(case.functions(), ["ecm.usb0"])
 
+    def test_up_refuses_a_second_ecm_function_after_an_interface_change(self):
+        case = Case()
+        self.assertEqual(case.run("up").returncode, 0)
+        (case.g / "UDC").write_text("\n")    # composed, unbound, still linked
+        res = case.run("up", PI_TOR_INTERFACE="usb9")
+        self.assertNotEqual(res.returncode, 0)
+        self.assertIn("existing ecm.usb0 does not match usb9", res.stderr)
+        self.assertIn("run 'usb-gadget-up down' first", res.stderr)
+        # no second function, no second link, no rebind, no split address file
+        self.assertEqual(case.functions(), ["ecm.usb0"])
+        self.assertEqual(sorted(p.name for p in (case.g / "configs/c.1").iterdir()
+                                if p.name.startswith("ecm.")), ["ecm.usb0"])
+        self.assertEqual(case.attr("UDC"), "\n")
+        self.assertNotIn("Name=usb9", case.networkd_file.read_text())
+
     def test_rebind_unbinds_then_rebinds_and_rewrites_the_address_file(self):
         case = Case()
         self.assertEqual(case.run("up").returncode, 0)
@@ -236,6 +251,17 @@ class GadgetUpTest(unittest.TestCase):
         res = case.run("rebind")
         self.assertNotEqual(res.returncode, 0)
         self.assertIn("run 'usb-gadget-up up' first", res.stderr)
+
+    def test_rebind_fails_when_the_netdev_does_not_come_back(self):
+        case = Case()
+        self.assertEqual(case.run("up").returncode, 0)
+        (case.netdir / "usb0").rmdir()      # the re-enumeration never recreates it
+        res = case.run("rebind")
+        self.assertNotEqual(res.returncode, 0)
+        self.assertIn("rebind failed: usb0 did not appear within 1s", res.stderr)
+        # the watchdog's only success signal is the exit status: no "rebound"
+        self.assertNotIn("rebound", res.stdout)
+        self.assertEqual(case.attr("UDC"), UDC)
 
     def test_up_without_a_udc_creates_nothing(self):
         case = Case(udc=None)
