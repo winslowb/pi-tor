@@ -26,7 +26,10 @@ import render
 import uplink
 
 # restart routing, expressed as key -> side effect
-PIHOLE_RECREATE_KEYS = ("tz", "pihole_webpassword", "dns_query_logging")
+# Every pihole-relevant key now reaches the container only through compose
+# env (FTLCONF_*), so a change needs a recreate, never a plain restart.
+PIHOLE_RECREATE_KEYS = ("tz", "pihole_webpassword", "dns_query_logging",
+                        "interface", "dns_port", "edns_packet_max")
 RULES_KEYS = ("interface", "subnet", "gateway_ip", "trans_port", "dns_port",
               "protected_hosts")
 UI_NOTE_KEYS = ("ui_port", "ui_password")
@@ -66,8 +69,6 @@ def apply_changes(root, posted, dry=None):
     _write_all(root, rendered)
 
     restart_tor = "tor/torrc" in changed
-    restart_pihole = any(rel.startswith("pihole/etc-dnsmasq.d/") and
-                         rel in changed for rel in rendered)
 
     diffed_env_keys = [k for k in schema.FIELDS
                        if before_values.get(k) != cfg[k] and
@@ -83,8 +84,6 @@ def apply_changes(root, posted, dry=None):
         if "error" not in report["restarts"]["pihole"]:
             report["restarts"]["pihole_health"] = \
                 _restart_with_health("pihole", started=False)
-    elif restart_pihole:
-        report["restarts"]["pihole"] = _restart_with_health("pihole")
     if rules_needed:
         report["restarts"]["rules"] = dockerops.run_rules(root, cfg)
     if ui_note:
@@ -195,8 +194,6 @@ def restore_latest_backup(root, dry=None):
     values = current["values"]
     if any(r == "tor/torrc" for r in restored):
         restarts["tor"] = _restart_with_health("tor")
-    if any(r.startswith("pihole/etc-dnsmasq.d/") for r in restored):
-        restarts["pihole"] = _restart_with_health("pihole")
     if any(r == ".env" for r in restored) and not dry:
         # env changes need recreate; rules re-applied with restored values
         restarts.setdefault("pihole_recreate_note",

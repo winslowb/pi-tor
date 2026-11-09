@@ -10,7 +10,7 @@ USER_HOME="/home/bill"
 PI_USER="bill"
 
 # Ensure base layout
-mkdir -p "${BASE}"/{tor,pihole/etc-pihole,pihole/etc-dnsmasq.d,bin,systemd}
+mkdir -p "${BASE}"/{tor,pihole/etc-pihole,bin,systemd}
 
 ############################
 # docker-compose.yml
@@ -45,17 +45,16 @@ services:
     container_name: pihole
     network_mode: "host"
     restart: unless-stopped
-        environment:
+    environment:
       TZ: "UTC"
-      WEBPASSWORD: "changeme"
-      DNS1: "127.0.0.1#5353"
-      DNS2: "127.0.0.1#5353"
-      DNSMASQ_LISTENING: "all"
-      PIHOLE_DNS_: "127.0.0.1#5353"
-      DNS_QUERY_LOGGING: "false"
-      ServerIP: "0.0.0.0"
-dns:
-      - 127.0.0.1
+      # Pi-hole v6 ignores the v5 variables (WEBPASSWORD, DNSMASQ_LISTENING,
+      # DNS_QUERY_LOGGING, PIHOLE_DNS_*) and does not read /etc/dnsmasq.d.
+      FTLCONF_webserver_api_password: "changeme"
+      FTLCONF_dns_listeningMode: "SINGLE"
+      FTLCONF_dns_interface: "usb0"
+      FTLCONF_dns_upstreams: "127.0.0.1#5353"
+      FTLCONF_dns_queryLogging: "false"
+      FTLCONF_misc_dnsmasq_lines: "edns-packet-max=1232"
     healthcheck:
       test: ["CMD-SHELL", "curl -fsS --max-time 3 http://127.0.0.1/admin || exit 1"]
       interval: 40s

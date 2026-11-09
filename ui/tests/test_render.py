@@ -26,14 +26,6 @@ class RenderDefaultsTest(unittest.TestCase):
             (".env", ".env.example"),
             (".env.example", ".env.example"),
             ("tor/torrc", "tor/torrc"),
-            ("pihole/etc-dnsmasq.d/02-listen.conf",
-             "pihole/etc-dnsmasq.d/02-listen.conf"),
-            ("pihole/etc-dnsmasq.d/02-upstream-tor.conf",
-             "pihole/etc-dnsmasq.d/02-upstream-tor.conf"),
-            ("pihole/etc-dnsmasq.d/02-usb0.conf",
-             "pihole/etc-dnsmasq.d/02-usb0.conf"),
-            ("pihole/etc-dnsmasq.d/99-tor-upstream.conf",
-             "pihole/etc-dnsmasq.d/99-tor-upstream.conf"),
             ("systemd/pi-tor.env.example",
              "systemd/pi-tor.env.example"),
         ]
@@ -67,9 +59,6 @@ class RenderDefaultsTest(unittest.TestCase):
         self.assertIn("SocksPolicy accept 10.44.0.0/24", torrc)
         self.assertIn("TransPort 10.44.0.1:9040", torrc)
         self.assertIn("DNSPort 10.44.0.1:5353", torrc)
-
-        listen = rendered["pihole/etc-dnsmasq.d/02-listen.conf"].decode()
-        self.assertIn("listen-address=10.44.0.1,127.0.0.1", listen)
 
         systemd = rendered["systemd/pi-tor.env.example"].decode()
         self.assertIn("PI_TOR_SUBNET=10.44.0.0/24", systemd)

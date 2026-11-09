@@ -124,10 +124,10 @@ reachable because the RETURN rule keeps it out of the redirect).
 The repo defaults assume `usb0` with subnet `10.12.194.0/24`. Update the
 following files if your gadget interface or network differs:
 
-- `pihole/etc-dnsmasq.d/02-listen.conf` – listen addresses
-- `pihole/etc-dnsmasq.d/02-usb0.conf` – interface name + EDNS size
 - `tor/torrc` – `SocksPort`, `TransPort`, `DNSPort`, ACLs
-- `.env` – Pi-hole timezone/password/logging
+- `.env` – Pi-hole timezone/password/logging, plus the interface, DNS port and
+  EDNS size that `docker-compose.yml` substitutes into Pi-hole's `FTLCONF_*`
+  keys (Pi-hole v6 reads no dnsmasq snippets from this repo)
 - `systemd/pi-tor.env.example` / `bin/pi-tor-rules.sh` env vars – interface and
   subnet controls
 - `bin/usb_route` / `bin/usb_route_undo` – tether the workstation through the
@@ -379,16 +379,29 @@ attaches, and a real host reached the stack over that link. Still
   `rebind` path has never been exercised against an actual RX stall (only
   the Pi Zero 2 W `g_ether` reload has).
 
-### Pi-hole v6 password and the LAN web surface
+### Pi-hole v6 environment variables
 
-`pihole/pihole` 2026.10.1 (Pi-hole v6) **ignores `WEBPASSWORD`**: it logs
-`No password set in environment or config file, assigning random password`.
-On the deployed board the `.env` value was applied once with the supported
-CLI, `docker exec -i pihole pihole setpassword`, and it persists in
+`pihole/pihole` 2026.10.1 (Pi-hole v6) ignores the v5 variables this repo used
+to set — `WEBPASSWORD`, `DNSMASQ_LISTENING`, `DNS_QUERY_LOGGING`,
+`PIHOLE_DNS_*` — and no longer reads `/etc/dnsmasq.d`. On the deployed board
+that left FTL on its own defaults (`dns.listeningMode=LOCAL`, empty
+`dns.interface`, upstreams `8.8.8.8,8.8.4.4`), and the password had to be
+applied once with `docker exec -i pihole pihole setpassword`; it persists in
 `/etc/pihole` across restarts (the entrypoint then logs `Password already set
-in config file`). A recreate that empties that volume reverts to a random
-password; the repo should migrate to `FTLCONF_webserver_api_password`
-instead of relying on `WEBPASSWORD`.
+in config file`).
+
+The repo now sets the v6 keys explicitly from `.env`: the password via
+`FTLCONF_webserver_api_password`, and the DNS policy via
+`FTLCONF_dns_listeningMode=SINGLE`, `FTLCONF_dns_interface`,
+`FTLCONF_dns_upstreams=127.0.0.1#<DNSPort>` and
+`FTLCONF_dns_queryLogging` (EDNS size goes through
+`FTLCONF_misc_dnsmasq_lines`). `FTLCONF_misc_etc_dnsmasq_d` stays off, so no
+`/etc/dnsmasq.d` file can widen the listener or add an upstream, and the
+directory is no longer mounted. A key set this way is **read-only in the
+Pi-hole web UI**. This is repo configuration only — it has not been deployed
+or verified on the board, which still carries the old
+`pihole/etc-dnsmasq.d/` files (inert now that the directory is not mounted)
+and needs a `docker compose up -d pihole` recreate to pick the env up.
 
 Both web surfaces are on the LAN, not just the gadget link: the config UI
 answers 401 unauthenticated and 200 with the password, Pi-hole does the same
@@ -632,7 +645,6 @@ sudo modprobe -r g_ether && sudo modprobe g_ether   # only for a genuine RX stal
 
 ```
 docker-compose.yml         # Tor + Pi-hole + config-UI stack
-pihole/etc-dnsmasq.d/      # Pi-hole dnsmasq overrides (tracked)
 pihole/etc-pihole/.gitkeep # bind mount placeholder (data ignored)
 tor/                       # Dockerfile + torrc + data dir placeholder
 ui/                        # config UI service: schema -> render -> apply

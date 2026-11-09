@@ -17,10 +17,6 @@ sys.path.insert(0, str(UI_DIR))
 CONFIG_FILES = [
     ".env.example",
     "tor/torrc",
-    "pihole/etc-dnsmasq.d/02-listen.conf",
-    "pihole/etc-dnsmasq.d/02-upstream-tor.conf",
-    "pihole/etc-dnsmasq.d/02-usb0.conf",
-    "pihole/etc-dnsmasq.d/99-tor-upstream.conf",
     "systemd/pi-tor.env.example",
 ]
 

@@ -3,8 +3,8 @@
 A single-page web app in the Python **standard library only** (no pip, no
 npm, no build step) that edits the pi-tor configuration through one
 validated form and applies it. It exists because the subnet / gateway /
-interface / port values were duplicated across `tor/torrc`, three
-`pihole/etc-dnsmasq.d/*.conf` files, `bin/pi-tor-rules.sh` env and
+interface / port values were duplicated across `tor/torrc`,
+`docker-compose.yml`, `bin/pi-tor-rules.sh` env and
 `systemd/pi-tor.env.example` with no single source of truth; changing the
 subnet by hand silently restart-loops tor and kills dnsmasq. Here, one
 schema (`config_schema.py`) renders all targets and validates before any
@@ -74,8 +74,8 @@ the gadget interface:
   address. They **must never go wildcard**: neither listener has a source
   ACL, so a wildcard would expose an unauthenticated transparent proxy and
   an open resolver on the Pi's other interfaces (e.g. Wi-Fi). `DNSPort` also
-  binds `127.0.0.1` because Pi-hole's dnsmasq upstream is
-  `server=127.0.0.1#<dns>`.
+  binds `127.0.0.1` because Pi-hole's upstream
+  (`FTLCONF_dns_upstreams`) is `127.0.0.1#<dns>`.
 
 `bin/uplink-check.sh` covers the start-ordering gap: after the uplink gate
 passes it waits up to 30 s (one log line per second) until every gadget
@@ -96,11 +96,12 @@ restart-looping slowly, with the dashboard still explaining why tor is down.
    step; there is no systemd rules unit any more.
 1. Files that change are backed up to `ui/backups/<UTC-stamp>/` (relative
    paths preserved) with a `manifest.json` of originals + sha256.
-2. All seven render targets plus `.env`/`.env.example` are written
-   atomically (`tmp` + `os.replace`, file mode preserved).
-3. Restart routing: torrc changed → restart `tor`; dnsmasq confs changed →
-   restart `pihole`; `.env` TZ/webpassword/logging changed →
-   `docker compose up -d --no-deps pihole` (recreate — a plain restart does
+2. All four render targets (`tor/torrc`, `.env`, `.env.example`,
+   `systemd/pi-tor.env.example`) are written atomically (`tmp` +
+   `os.replace`, file mode preserved).
+3. Restart routing: torrc changed → restart `tor`; any `.env` key compose
+   passes to Pi-hole (TZ, password, query logging, interface, DNS port, EDNS)
+   → `docker compose up -d --no-deps pihole` (recreate — a plain restart does
    not re-read env); rules keys changed (interface, subnet, gateway,
    trans/dns ports) → `bin/pi-tor-rules.sh apply` with explicit
    `PI_TOR_*` env overrides (the container's CAP_NET_ADMIN writes the
@@ -168,9 +169,9 @@ defaults.
 - The ui container must contain `iptables`/`iproute2` for the rules script
   (installed in `Dockerfile`); only the nft backend is accepted, checked
   via `iptables -V` before any apply.
-- `02-upstream-tor.conf` and `99-tor-upstream.conf` are near-duplicates;
-  both are rendered as committed today (the UI does not consolidate them —
-  that is a separate, explicit change).
+- `02-upstream-tor.conf` and `99-tor-upstream.conf` are gone: Pi-hole v6
+  takes the upstream from `FTLCONF_dns_upstreams`, so the duplicated
+  dnsmasq snippets had no effect and only risked contradicting the FTL keys.
 - The compose mount path for docker CLI plugins
   (`/usr/libexec/docker/cli-plugins`) is Debian's default; adjust for your
   host if it differs.

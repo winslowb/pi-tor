@@ -39,14 +39,24 @@ services:
     network_mode: "host"
     restart: unless-stopped
     depends_on: [tor]
+    # Pi-hole v6 owns dnsmasq's configuration: the v5 variables (WEBPASSWORD,
+    # DNSMASQ_LISTENING, DNS_QUERY_LOGGING, PIHOLE_DNS_*) are ignored, and
+    # /etc/dnsmasq.d is no longer read unless FTLCONF_misc_etc_dnsmasq_d=true.
+    # That flag stays off on purpose, so these FTLCONF_* keys are the entire
+    # DNS policy: listen on the gadget interface only (loopback is implicit in
+    # SINGLE), and forward exclusively to tor's DNSPort. An empty or missing
+    # upstream list resolves nothing rather than falling back to resolv.conf.
+    # Every key set here is read-only in the Pi-hole web UI.
     environment:
       TZ: "${PI_TOR_TZ:-UTC}"
-      WEBPASSWORD: "${PIHOLE_WEBPASSWORD:-changeme}"
-      DNSMASQ_LISTENING: "all"
-      DNS_QUERY_LOGGING: "${PIHOLE_DNS_QUERY_LOGGING:-false}"
+      FTLCONF_webserver_api_password: "${PIHOLE_WEBPASSWORD:-changeme}"
+      FTLCONF_dns_listeningMode: "SINGLE"
+      FTLCONF_dns_interface: "${PI_TOR_INTERFACE:-usb0}"
+      FTLCONF_dns_upstreams: "127.0.0.1#${PI_TOR_DNS_PORT:-5353}"
+      FTLCONF_dns_queryLogging: "${PIHOLE_DNS_QUERY_LOGGING:-false}"
+      FTLCONF_misc_dnsmasq_lines: "edns-packet-max=${PI_TOR_EDNS_PACKET_MAX:-1232}"
     volumes:
       - ./pihole/etc-pihole:/etc/pihole
-      - ./pihole/etc-dnsmasq.d:/etc/dnsmasq.d
     healthcheck:
       test: ["CMD-SHELL", "bash -c '</dev/tcp/127.0.0.1/80' || exit 1"]
       interval: 40s
