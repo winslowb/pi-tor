@@ -385,25 +385,54 @@ attaches, and a real host reached the stack over that link. Still
 
 `pihole/pihole` 2026.10.1 (Pi-hole v6) ignores the v5 variables this repo used
 to set — `WEBPASSWORD`, `DNSMASQ_LISTENING`, `DNS_QUERY_LOGGING`,
-`PIHOLE_DNS_*` — and no longer reads `/etc/dnsmasq.d`. On the deployed board
+`PIHOLE_DNS_*` — and no longer reads `/etc/dnsmasq.d`. On the first deployment
 that left FTL on its own defaults (`dns.listeningMode=LOCAL`, empty
 `dns.interface`, upstreams `8.8.8.8,8.8.4.4`), and the password had to be
 applied once with `docker exec -i pihole pihole setpassword`; it persists in
 `/etc/pihole` across restarts (the entrypoint then logs `Password already set
 in config file`).
 
-The repo now sets the v6 keys explicitly from `.env`: the password via
-`FTLCONF_webserver_api_password`, and the DNS policy via
+That v6 fix is now deployed on the board (commit `6bb4752`, recreated with
+`docker compose up -d pihole`). `.env` feeds the supported keys: the password
+via `FTLCONF_webserver_api_password`, and the DNS policy via
 `FTLCONF_dns_listeningMode=SINGLE`, `FTLCONF_dns_interface`,
-`FTLCONF_dns_upstreams=127.0.0.1#<DNSPort>` and
-`FTLCONF_dns_queryLogging` (EDNS size goes through
-`FTLCONF_misc_dnsmasq_lines`). `FTLCONF_misc_etc_dnsmasq_d` stays off, so no
-`/etc/dnsmasq.d` file can widen the listener or add an upstream, and the
-directory is no longer mounted. A key set this way is **read-only in the
-Pi-hole web UI**. This is repo configuration only — it has not been deployed
-or verified on the board, which still carries the old
-`pihole/etc-dnsmasq.d/` files (inert now that the directory is not mounted)
-and needs a `docker compose up -d pihole` recreate to pick the env up.
+`FTLCONF_dns_upstreams=127.0.0.1#<DNSPort>` and `FTLCONF_dns_queryLogging`
+(EDNS size goes through `FTLCONF_misc_dnsmasq_lines`).
+`FTLCONF_misc_etc_dnsmasq_d` stays off, so no `/etc/dnsmasq.d` file can widen
+the listener or add an upstream; the directory is no longer mounted and the
+old v5 snippets were moved to a root-only backup outside the Compose project.
+A key set this way is **read-only in the Pi-hole web UI**.
+
+Live readback (`pihole-FTL --config <key>`) matches that environment:
+
+    dns.listeningMode  = SINGLE
+    dns.interface      = usb0
+    dns.upstreams      = [ 127.0.0.1#5353 ]
+    dns.queryLogging   = false
+    misc.dnsmasq_lines = [ edns-packet-max=1232 ]
+    misc.etc_dnsmasq_d = false
+
+Startup logged `6 FTLCONF environment variables found (6 used, 0 invalid, 0
+ignored)` and `Assigning password by Environment Variable`, with no random
+password and no `8.8.8.8` fallback. Functionally: queries to the gadget address
+`10.12.194.1` returned real A records, a unique query to the board's LAN
+address `192.168.0.27` timed out from both the tether host and pihole.lan, and
+two 20-second `tcpdump` captures on the tether host's WAN interface, taken
+during fresh queries, saw zero packets to TCP/UDP 53 — no DNS leaves the board
+off the Tor path.
+
+`ss` still shows pihole-FTL on `0.0.0.0:53` and the log says `listening on
+0.0.0.0 port 53`. That is expected, not a leak: `SINGLE` +
+`dns.interface=usb0` becomes dnsmasq `interface=usb0` *without*
+`bind-interfaces`, so dnsmasq binds the wildcard socket and drops queries that
+arrive on any other interface. Judge this setting from the interface-level
+negative/positive test above, never from `ss` or that log line.
+
+Not exercised by this deploy: cold boot, a real watchdog RX-stall recovery, a
+live password change, and the rollback path. `node_exporter` is unchanged
+(`:9100` HTTP 200, same PID) and the `tor` container kept its `StartedAt` and
+restart count; the management surfaces remain separately exposed and
+authenticated as the next paragraph describes.
 
 Both web surfaces are on the LAN, not just the gadget link: the config UI
 answers 401 unauthenticated and 200 with the password, Pi-hole does the same
