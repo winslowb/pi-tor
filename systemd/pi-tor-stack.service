@@ -1,14 +1,17 @@
 [Unit]
 Description=pi-tor-pihole docker compose stack
-After=docker.service
+After=docker.service pi-tor-gadget.service
+# starting the stack starts the gadget too; Wants (not Requires) keeps a
+# gadget failure from holding the stack back -- the UI then explains it
+Wants=pi-tor-gadget.service
 Requires=docker.service
 
 [Service]
 Type=oneshot
 RemainAfterExit=yes
-Environment=PROJECT_DIR=/opt/pi-tor
 EnvironmentFile=-/etc/default/pi-tor
-WorkingDirectory=${PROJECT_DIR}
+# literal: systemd cannot expand a variable into a path
+WorkingDirectory=/opt/pi-tor
 ExecStart=/usr/bin/docker compose up -d --build
 ExecStop=/usr/bin/docker compose down
 TimeoutStartSec=300

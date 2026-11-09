@@ -16,7 +16,8 @@ FIELDS = {
     "interface": {
         "label": "USB gadget interface",
         "default": "usb0",
-        "targets": "02-usb0.conf, firewall rules env, systemd env",
+        "targets": ".env → docker-compose.yml (FTLCONF_dns_interface), "
+                   "firewall rules env, systemd env",
     },
     "uplink_interface": {
         "label": "Uplink interface (tor's internet route)",
@@ -28,7 +29,7 @@ FIELDS = {
     "gateway_ip": {
         "label": "Gateway IP",
         "default": "10.12.194.1",
-        "targets": "tor/torrc, 02-listen.conf, rules env, systemd env",
+        "targets": "tor/torrc, rules env, systemd env",
     },
     "subnet": {
         "label": "Gadget subnet (CIDR)",
@@ -55,7 +56,8 @@ FIELDS = {
     "dns_port": {
         "label": "Tor DNS port",
         "default": "5353",
-        "targets": "tor/torrc, dnsmasq upstreams, rules env, systemd env",
+        "targets": "tor/torrc, .env → docker-compose.yml "
+                   "(FTLCONF_dns_upstreams), rules env, systemd env",
     },
     "virtual_addr_network": {
         "label": "Tor virtual address network (CIDR)",
@@ -75,7 +77,8 @@ FIELDS = {
     "edns_packet_max": {
         "label": "dnsmasq EDNS packet max",
         "default": "1232",
-        "targets": "02-usb0.conf, 99-tor-upstream.conf",
+        "targets": ".env → docker-compose.yml "
+                   "(FTLCONF_misc_dnsmasq_lines)",
     },
     "tz": {
         "label": "Timezone (IANA name)",
@@ -86,12 +89,13 @@ FIELDS = {
         "label": "Pi-hole admin password",
         "default": "changeme",
         "secret": True,
-        "targets": ".env",
+        "targets": ".env → docker-compose.yml "
+                   "(FTLCONF_webserver_api_password)",
     },
     "dns_query_logging": {
         "label": "Pi-hole DNS query logging",
         "default": "false",
-        "targets": ".env",
+        "targets": ".env → docker-compose.yml (FTLCONF_dns_queryLogging)",
     },
     "ui_port": {
         "label": "Config UI port",

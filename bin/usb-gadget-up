@@ -1,0 +1,190 @@
+#!/bin/sh
+# pi-tor USB gadget bring-up — configfs, CDC ECM only.
+#
+# The Raspberry Pi path uses the legacy g_ether module, which the kernel
+# creates from config.txt (`dtoverlay=dwc2,dr_mode=peripheral`). A Radxa Zero
+# (Armbian, meson64) has g_ether present and loadable (CONFIG_USB_ETH=m) but
+# nothing autoloads it and there is no config.txt overlay, so it has no gadget
+# to bind and `usb0` never appears. This script composes the gadget on
+# configfs instead — the path this kernel supports and the one whose
+# re-enumeration the watchdog can drive — with one ECM function named
+# ifname=usb0, so every existing config (dnsmasq `interface=usb0`, the
+# 10.12.194.1 torrc binds, the firewall rules) keeps working unchanged.
+# Deliberately no HID, mass-storage or other functions: this is a gateway,
+# not a payload device.
+#
+# Subcommands:
+#   up       (default) create the gadget if needed and bind it to the UDC
+#   down     unbind and remove everything this script created
+#   rebind   unbind + bind: re-enumerates the gadget, the configfs analogue of
+#            the Pi's `modprobe -r g_ether && modprobe g_ether`, which is what
+#            bin/gadget-watchdog.sh needs as WATCH_RELOAD_CMD on this board
+#   status   report what exists; exit 0 when bound
+#
+# Addressing is not configured here (/etc/netplan owns the board's network).
+# `up` writes a runtime-only systemd-networkd file carrying PI_TOR_GATEWAY on
+# PI_TOR_SUBNET, so a fresh boot gets the gadget address without an /etc edit
+# and without a second copy of the gateway value.
+#
+# Test seams: PI_TOR_GADGETFS, PI_TOR_UDC_DIR, PI_TOR_NET_DIR,
+# PI_TOR_NETWORKD_DIR, PI_TOR_GADGET_WAIT, PI_TOR_NETWORKCTL, PI_TOR_MODPROBE.
+set -u
+
+GADGETFS=${PI_TOR_GADGETFS:-/sys/kernel/config/usb_gadget}
+UDC_DIR=${PI_TOR_UDC_DIR:-/sys/class/udc}
+NET_DIR=${PI_TOR_NET_DIR:-/sys/class/net}
+NETWORKD_DIR=${PI_TOR_NETWORKD_DIR:-/run/systemd/network}
+IF=${PI_TOR_INTERFACE:-usb0}
+GW=${PI_TOR_GATEWAY:-10.12.194.1}
+SUBNET=${PI_TOR_SUBNET:-10.12.194.0/24}
+WAIT=${PI_TOR_GADGET_WAIT:-10}
+NETWORKCTL=${PI_TOR_NETWORKCTL:-networkctl}
+MODPROBE=${PI_TOR_MODPROBE:-modprobe}
+NAME=pi_tor
+G=$GADGETFS/$NAME
+F=$G/functions/ecm.$IF
+NW=$NETWORKD_DIR/10-pi-tor-usb0.network
+
+log() { printf '[usb-gadget] %s\n' "$*"; }
+die() { printf '[usb-gadget] %s\n' "$*" >&2; exit 1; }
+
+udc_name() { ls "$UDC_DIR" 2>/dev/null | sed -n '1p'; }
+is_bound() { [ -n "$(cat "$G/UDC" 2>/dev/null)" ]; }
+
+# configfs attributes take the raw value; a failed write is a real error
+attr() { # <path> <value>
+  printf '%s' "$2" > "$1" || die "cannot write '$2' to $1"
+}
+
+prefix=${SUBNET#*/}
+case "$prefix" in '' | *[!0-9]*) prefix=24 ;; esac
+
+networkd_conf() {
+  [ -d "$NETWORKD_DIR" ] || return 0
+  # ConfigureWithoutCarrier: u_ether keeps carrier off until the USB host
+  # selects the ECM data altsetting, and networkd would otherwise never
+  # address the link.
+  printf '[Match]\nName=%s\n\n[Network]\nAddress=%s/%s\nConfigureWithoutCarrier=yes\nLinkLocalAddressing=no\nIPv6AcceptRA=no\n' \
+    "$IF" "$GW" "$prefix" > "$NW" || die "cannot write $NW"
+  if command -v "$NETWORKCTL" >/dev/null 2>&1; then
+    "$NETWORKCTL" reload >/dev/null 2>&1 || log "WARNING: $NETWORKCTL reload failed; $IF may stay unaddressed"
+  fi
+}
+
+net_wait() { # bounded wait for the netdevice the bind creates
+  i=0
+  while [ "$i" -lt "$WAIT" ]; do
+    if [ -e "$NET_DIR/$IF" ]; then
+      log "$IF is up (udc $(cat "$G/UDC"))"
+      return 0
+    fi
+    i=$((i + 1))
+    sleep 1
+  done
+  return 1
+}
+
+up() {
+  # Before any mutation, bound or not: a changed PI_TOR_INTERFACE would add a
+  # second ECM function (splitting the gateway from dnsmasq) or repoint the
+  # runtime .network file away from a working gadget.
+  for fn in "$G"/functions/ecm.*; do
+    [ -d "$fn" ] || continue
+    [ "${fn##*/}" = "ecm.$IF" ] ||
+      die "existing ${fn##*/} does not match $IF: run '${0##*/} down' first"
+  done
+  if ! is_bound; then
+    [ -d "$GADGETFS" ] || "$MODPROBE" libcomposite 2>/dev/null || true
+    [ -d "$GADGETFS" ] ||
+      die "no configfs usb_gadget at $GADGETFS: modprobe libcomposite failed or CONFIG_USB_CONFIGFS is off"
+    udc=$(udc_name)
+    [ -n "$udc" ] || die "no UDC under $UDC_DIR: the controller is not in peripheral/otg mode"
+    mkdir -p "$G/strings/0x409" "$G/configs/c.1" || die "cannot create $G"
+    attr "$G/idVendor" 0x1d6b      # Linux Foundation
+    attr "$G/idProduct" 0x0104     # Multifunction Composite Gadget
+    attr "$G/bcdDevice" 0x0100
+    attr "$G/bcdUSB" 0x0200
+    printf 'pi-tor' > "$G/strings/0x409/manufacturer" || die "cannot write strings"
+    printf 'pi-tor ECM gateway' > "$G/strings/0x409/product" || die "cannot write strings"
+    printf 'pi-tor' > "$G/strings/0x409/serialnumber" || die "cannot write strings"
+    mkdir -p "$F" || die "cannot create ECM function $F"
+    # configfs rejects ifname with -EBUSY while the function is referenced,
+    # and a gadget that was only unbound still has it: keep the name it got.
+    if [ ! -e "$F/ifname" ]; then
+      attr "$F/ifname" "$IF"       # the name every existing config assumes
+    fi
+    [ -e "$G/configs/c.1/ecm.$IF" ] || ln -s "$F" "$G/configs/c.1/ecm.$IF" ||
+      die "cannot link ECM function into c.1"
+    attr "$G/configs/c.1/MaxPower" 250   # same advertised draw as g_ether
+    networkd_conf
+    log "binding $udc: ECM only, ifname $IF, $GW/$prefix"
+    attr "$G/UDC" "$udc"
+  else
+    log "already bound to $(cat "$G/UDC"); nothing to create"
+    networkd_conf
+  fi
+  net_wait || die "$IF did not appear within ${WAIT}s; check dmesg for the UDC bind"
+  log "ready: $IF exists; $GW/$prefix is set for when the host attaches ($NW)"
+}
+
+down() {
+  if [ -e "$G" ]; then
+    if is_bound; then
+      u=$(cat "$G/UDC")
+      printf '\n' > "$G/UDC" || die "cannot unbind $u"
+      log "unbound $u"
+    fi
+    # Remove what is actually linked, not `ecm.$IF`: PI_TOR_INTERFACE may have
+    # changed since composition, and configfs refuses to drop a referenced
+    # function, which would then block every remaining rmdir.
+    for link in "$G"/configs/c.1/ecm.*; do
+      [ -e "$link" ] || [ -L "$link" ] || continue
+      rm -f "$link" || die "cannot unlink $link"
+    done
+    for fn in "$G"/functions/ecm.*; do
+      [ -d "$fn" ] || continue
+      rmdir "$fn" || log "WARNING: cannot remove $fn"
+    done
+    # children before parents; configfs will not drop a non-empty directory
+    rmdir "$G/configs/c.1" "$G/configs" "$G/strings/0x409" "$G/strings" \
+      "$G/functions" "$G" 2>/dev/null
+  fi
+  rm -f "$NW"
+  if command -v "$NETWORKCTL" >/dev/null 2>&1; then
+    "$NETWORKCTL" reload >/dev/null 2>&1 || true
+  fi
+  # Never report success over a gadget left behind: `up` and the watchdog
+  # would inherit it.
+  [ -e "$G" ] && die "teardown incomplete: $G still exists (leftover function or symlink)"
+  log "gadget down"
+  return 0
+}
+
+rebind() {
+  [ -e "$G" ] || die "no gadget at $G: run '${0##*/} up' first"
+  is_bound || die "gadget at $G is not bound: run '${0##*/} up'"
+  udc=$(cat "$G/UDC")
+  log "unbinding $udc to re-enumerate"
+  printf '\n' > "$G/UDC" || die "cannot unbind $udc"
+  sleep 1   # the legacy reload's settle; the UDC needs to see the disconnect
+  attr "$G/UDC" "$udc"
+  networkd_conf
+  net_wait || die "rebind failed: $IF did not appear within ${WAIT}s after re-enumerating $udc"
+  log "rebound $udc on $IF"
+}
+
+status() {
+  [ -e "$G" ] || { log "no gadget at $G"; return 1; }
+  net=absent
+  [ -e "$NET_DIR/$IF" ] && net=up
+  log "gadget $G: udc=$(cat "$G/UDC" 2>/dev/null) ifname=$IF net=$net"
+  is_bound
+}
+
+case "${1:-up}" in
+  up)     up ;;
+  down)   down ;;
+  rebind) rebind ;;
+  status) status ;;
+  *) echo "usage: ${0##*/} [up|down|rebind|status]" >&2; exit 2 ;;
+esac

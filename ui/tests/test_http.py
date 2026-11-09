@@ -82,7 +82,6 @@ class PreviewTest(HttpTestBase):
         self.assertEqual(code, 200)
         changed = {rel for rel, d in body["diffs"].items() if d}
         self.assertIn("tor/torrc", changed)
-        self.assertIn("pihole/etc-dnsmasq.d/02-listen.conf", changed)
         self.assertIn("systemd/pi-tor.env.example", changed)
         # env files untouched: the subnet change does not reach them
         self.assertNotIn(".env", changed)

@@ -1,7 +1,10 @@
 """Render all pi-tor config files from the schema, and parse them back.
 
-The seven committed files (plus the live `.env`, which shares the
+The three committed files (plus the live `.env`, which shares the
 `.env.example` template) must round-trip byte-identically at defaults.
+Pi-hole's DNS policy is no longer rendered into dnsmasq snippets: v6 ignores
+`/etc/dnsmasq.d` unless asked, so interface, listener mode and upstream live
+in `docker-compose.yml` as `FTLCONF_*` substitutions from this `.env`.
 """
 import difflib
 import re
@@ -56,36 +59,9 @@ AutomapHostsOnResolve 1
 
 """
 
-    listen_conf = f"""# Answer on usb0 and loopback explicitly
-listen-address={cfg['gateway_ip']},127.0.0.1
-# Do NOT restrict to "local only" (prevents REFUSED on legit clients)
-local-service=0
-"""
-
-    upstream_tor_conf = f"""server=127.0.0.1#{cfg['dns_port']}
-no-resolv
-"""
-
-    usb0_conf = f"""interface={cfg['interface']}
-except-interface=lo
-# don't rebind to OS resolver
-no-resolv
-# upstream stays Tor DNSPort
-server=127.0.0.1#{cfg['dns_port']}
-edns-packet-max={cfg['edns_packet_max']}
-"""
-
-    tor_upstream_conf = f"""no-resolv
-server=127.0.0.1#{cfg['dns_port']}
-edns-packet-max={cfg['edns_packet_max']}
-"""
-
     systemd_env = f"""# Copy this file to `/etc/default/pi-tor` (or another path referenced by
 # EnvironmentFile=) to override defaults used by the provided systemd units
 # and helper scripts.
-
-# Absolute path to the cloned repo
-PROJECT_DIR=/opt/pi-tor
 
 # USB gadget interface + addressing used for the workstation tether
 PI_TOR_INTERFACE={cfg['interface']}
@@ -106,11 +82,17 @@ PI_TOR_PROTECTED_HOSTS={cfg['protected_hosts']}
 # Timezone passed to the containers (IANA tz database format)
 PI_TOR_TZ={cfg['tz']}
 
-# Password for the Pi-hole admin UI
+# Pi-hole admin UI password (compose: FTLCONF_webserver_api_password)
 PIHOLE_WEBPASSWORD={cfg['pihole_webpassword']}
 
 # Whether Pi-hole should log every DNS query (true/false)
 PIHOLE_DNS_QUERY_LOGGING={cfg['dns_query_logging']}
+
+# Pi-hole DNS plumbing: compose substitutes these into
+# FTLCONF_dns_interface / FTLCONF_dns_upstreams / FTLCONF_misc_dnsmasq_lines
+PI_TOR_INTERFACE={cfg['interface']}
+PI_TOR_DNS_PORT={cfg['dns_port']}
+PI_TOR_EDNS_PACKET_MAX={cfg['edns_packet_max']}
 
 # Config UI (HTTP Basic auth; user: pi-tor)
 PI_TOR_UI_PORT={cfg['ui_port']}
@@ -121,26 +103,14 @@ PI_TOR_UI_PASSWORD={cfg['ui_password']}
         ".env": envfile.encode(),
         ".env.example": envfile.encode(),
         "tor/torrc": torrc.encode(),
-        "pihole/etc-dnsmasq.d/02-listen.conf": listen_conf.encode(),
-        "pihole/etc-dnsmasq.d/02-upstream-tor.conf": upstream_tor_conf.encode(),
-        "pihole/etc-dnsmasq.d/02-usb0.conf": usb0_conf.encode(),
-        "pihole/etc-dnsmasq.d/99-tor-upstream.conf": tor_upstream_conf.encode(),
         "systemd/pi-tor.env.example": systemd_env.encode(),
     }
 
 
 RENDER_TARGETS = [".env", ".env.example", "tor/torrc",
-                  "pihole/etc-dnsmasq.d/02-listen.conf",
-                  "pihole/etc-dnsmasq.d/02-upstream-tor.conf",
-                  "pihole/etc-dnsmasq.d/02-usb0.conf",
-                  "pihole/etc-dnsmasq.d/99-tor-upstream.conf",
                   "systemd/pi-tor.env.example"]
 
 RAW_FILES = ["tor/torrc",
-             "pihole/etc-dnsmasq.d/02-listen.conf",
-             "pihole/etc-dnsmasq.d/02-upstream-tor.conf",
-             "pihole/etc-dnsmasq.d/02-usb0.conf",
-             "pihole/etc-dnsmasq.d/99-tor-upstream.conf",
              "systemd/pi-tor.env.example",
              "docker-compose.yml"]
 
@@ -195,10 +165,6 @@ def read_current(root):
     warnings = []
 
     torrc = _read(root, "tor/torrc")
-    listen = _read(root, "pihole/etc-dnsmasq.d/02-listen.conf")
-    usb0 = _read(root, "pihole/etc-dnsmasq.d/02-usb0.conf")
-    upstream = _read(root, "pihole/etc-dnsmasq.d/02-upstream-tor.conf")
-    tor_up = _read(root, "pihole/etc-dnsmasq.d/99-tor-upstream.conf")
     # The live .env, falling back to the committed example template
     env = _read(root, ".env")
     env_source = ".env" if env is not None else ".env.example"
@@ -235,36 +201,6 @@ def read_current(root):
             if m:
                 set_from("exit_nodes_include", "tor/torrc", m.group(1))
 
-    if listen:
-        m = re.search(r"^listen-address=([0-9.]+),127\.0\.0\.1\s*$",
-                      listen, re.M)
-        if m:
-            set_from("gateway_ip", "pihole/etc-dnsmasq.d/02-listen.conf",
-                     m.group(1))
-
-    for text, rel in ((usb0, "pihole/etc-dnsmasq.d/02-usb0.conf"),
-                      (tor_up, "pihole/etc-dnsmasq.d/99-tor-upstream.conf")):
-        if not text:
-            continue
-        m = re.search(r"^interface=(\S+)\s*$", text, re.M)
-        if m:
-            set_from("interface", rel, m.group(1))
-        m = re.search(r"^edns-packet-max=(\d+)\s*$", text, re.M)
-        if m:
-            set_from("edns_packet_max", rel, m.group(1))
-
-    for text, rel in (((usb0, "pihole/etc-dnsmasq.d/02-usb0.conf"),
-                       (upstream, "pihole/etc-dnsmasq.d/02-upstream-tor.conf"),
-                       (tor_up, "pihole/etc-dnsmasq.d/99-tor-upstream.conf"))):
-        # dnsmasq upstream lines are a fallback; torrc wins when present
-        if "dns_port" in sources:
-            break
-        if not text:
-            continue
-        m = re.search(r"^server=127\.0\.0\.1#(\d+)\s*$", text, re.M)
-        if m:
-            set_from("dns_port", rel, m.group(1))
-
     if systemd:
         for env_key, key in (("PI_TOR_INTERFACE", "interface"),
                              ("PI_TOR_UPLINK", "uplink_interface"),
@@ -277,6 +213,15 @@ def read_current(root):
             # the parsed files above win already when present.
             if env_key in sysd and key not in sources:
                 set_from(key, "systemd/pi-tor.env.example", sysd[env_key])
+
+    # Compose plumbing in .env; a fallback only, the rendered files above stay
+    # authoritative. edns_packet_max now lives nowhere but here (it reaches
+    # Pi-hole through FTLCONF_misc_dnsmasq_lines).
+    for env_key, key in (("PI_TOR_INTERFACE", "interface"),
+                         ("PI_TOR_DNS_PORT", "dns_port"),
+                         ("PI_TOR_EDNS_PACKET_MAX", "edns_packet_max")):
+        if env_key in envd and key not in sources:
+            set_from(key, env_source, envd[env_key])
 
     for env_key, key in (("PI_TOR_TZ", "tz"),
                          ("PIHOLE_WEBPASSWORD", "pihole_webpassword"),

@@ -56,6 +56,8 @@ A minimal Docker stack for a USB-gadget Raspberry Pi that runs Pi-hole as the DN
 
 - Raspberry Pi OS (or any Debian-based distro) with the USB gadget interface
   exposed as `usb0`
+- Radxa Zero on Armbian (`aarch64`) — deployed and verified there; see
+  [Radxa Zero (ARM64)](#radxa-zero-arm64)
 - Docker Engine 24+ with the Compose plugin (`docker compose`)
 - A dedicated IPv4 gadget subnet (defaults to `10.12.194.0/24`)
 - iptables is not needed on the host: the ui image ships it (nft backend,
@@ -122,10 +124,10 @@ reachable because the RETURN rule keeps it out of the redirect).
 The repo defaults assume `usb0` with subnet `10.12.194.0/24`. Update the
 following files if your gadget interface or network differs:
 
-- `pihole/etc-dnsmasq.d/02-listen.conf` – listen addresses
-- `pihole/etc-dnsmasq.d/02-usb0.conf` – interface name + EDNS size
 - `tor/torrc` – `SocksPort`, `TransPort`, `DNSPort`, ACLs
-- `.env` – Pi-hole timezone/password/logging
+- `.env` – Pi-hole timezone/password/logging, plus the interface, DNS port and
+  EDNS size that `docker-compose.yml` substitutes into Pi-hole's `FTLCONF_*`
+  keys (Pi-hole v6 reads no dnsmasq snippets from this repo)
 - `systemd/pi-tor.env.example` / `bin/pi-tor-rules.sh` env vars – interface and
   subnet controls
 - `bin/usb_route` / `bin/usb_route_undo` – tether the workstation through the
@@ -153,8 +155,10 @@ The firewall rules need no unit of their own: the ui container applies
 them on start, so `docker compose up` is the only bring-up step. To have
 the stack come up on boot:
 
-1. Copy `systemd/pi-tor.env.example` to `/etc/default/pi-tor` and update
-   `PROJECT_DIR` (any `PI_TOR_*` overrides there feed the stack unit).
+1. Copy `systemd/pi-tor.env.example` to `/etc/default/pi-tor` (any
+   `PI_TOR_*` overrides there feed the units). The units assume the checkout
+   is at `/opt/pi-tor`; if yours is not, edit their `ExecStart`/
+   `WorkingDirectory` paths — systemd cannot expand a variable into a path.
 2. Copy the stack unit:
    ```bash
    sudo cp systemd/pi-tor-stack.service /etc/systemd/system/
@@ -165,7 +169,7 @@ the stack come up on boot:
    sudo systemctl enable --now pi-tor-stack.service
    ```
 
-`pi-tor-stack` runs `docker compose up -d --build` from `PROJECT_DIR` on
+`pi-tor-stack` runs `docker compose up -d --build` from `/opt/pi-tor` on
 boot; the ui container inside it applies the firewall rules. For a manual
 run of the rules themselves (e.g. flushing after a `compose down`),
 `bin/pi-tor-rules.sh apply|flush|show-rules` remains the single
@@ -176,8 +180,8 @@ implementation — run it with `sudo` when the stack is not up.
 `ui/` is a third compose service on the Pi, at `http://10.12.194.1:8080`
 (HTTP Basic, user `pi-tor`, password from `PI_TOR_UI_PASSWORD` in `.env`).
 It exists because the same four values — gadget subnet/gateway, interface,
-ports, timezone/password — are duplicated across `tor/torrc`, four
-`pihole/etc-dnsmasq.d/*.conf` files, `bin/pi-tor-rules.sh` and `.env`. Editing
+ports, timezone/password — are duplicated across `tor/torrc`, `.env`,
+`docker-compose.yml` and `bin/pi-tor-rules.sh`. Editing
 one by hand leaves tor unable to bind `10.12.194.1:9040` while dnsmasq keeps
 listening on a stale address, and both fail silently.
 
@@ -195,9 +199,10 @@ listening on a stale address, and both fail silently.
 - **Logs panel.** The `tor` and `pihole` buttons tail the containers over the
   docker socket; the response is a Docker multiplexed stream, demuxed in
   `ui/dockerops.py`.
-- **Dry run.** `PI_TOR_UI_DRY_RUN=1` renders and previews without writing or
-  executing anything — how it was tested before the device saw it.
-- Tests: `python3 -m unittest discover -s ui/tests` (88 tests, stdlib only).
+- **Dry run.** `PI_TOR_UI_DRY_RUN=1` skips Docker/socket/firewall actions, but
+  apply and rollback still write rendered files and backups; it is not a
+  no-write preview. Use `/api/preview` for a diff that writes nothing.
+- Tests: `python3 -m unittest discover -s ui/tests` (119 tests, stdlib only).
   Details in [ui/README.md](ui/README.md).
 
 **Security boundary, stated plainly:** the ui container mounts
@@ -231,6 +236,215 @@ HTML — open them in any browser, no server needed.
 - [`doc/diagrams/pi-tor-sequence.html`](doc/diagrams/pi-tor-sequence.html)
   — one real request: DNS resolve, redirect, circuit, response, with the
   timings measured above. Source: `pi-tor-sequence.candidate.json`.
+
+## Radxa Zero (ARM64)
+
+Deployed and verified on a Radxa Zero running Armbian 26.11 (Debian trixie,
+`aarch64`, kernel 6.18.57-current-meson64, UDC `ff400000.usb`) — the full
+stack, tethered to a workstation that then reached the internet only through
+tor. Both hardware paths remain supported: the Pi Zero 2 W keeps the
+`config.txt`/`g_ether` route above, and this board uses configfs. Neither
+replaces the other.
+
+A Radxa Zero has no `config.txt` overlay, and `g_ether` — although present
+and loadable (`CONFIG_USB_ETH=m`; `modprobe -n -v g_ether` resolves
+`libcomposite`, `u_ether`, `usb_f_rndis` and `g_ether.ko`) — is not
+autoloaded and has no gadget to bind, so `usb0` never appears on its own. The
+gadget is composed on configfs instead by `bin/usb-gadget-up`
+(`systemd/pi-tor-gadget.service`): configfs is the path this kernel supports,
+needs no device-tree overlay, and gives the watchdog a re-enumeration it can
+drive from a script. The script creates **one CDC ECM function** named
+`ifname=usb0` — no HID, no mass storage — so every existing config
+(`interface=usb0`, the `10.12.194.1` torrc binds, the firewall rules) works
+unchanged.
+
+Measured on the deployed board:
+
+- kernel has `CONFIG_USB_CONFIGFS`, `CONFIG_USB_CONFIGFS_ECM`,
+  `CONFIG_USB_F_ECM`, `CONFIG_USB_LIBCOMPOSITE`, `CONFIG_USB_DWC2=y`
+  (DT `dr_mode=otg`) and `CONFIG_NF_TABLES` / `CONFIG_IP_NF_NAT` for the
+  iptables-nft rules the ui container applies; no `dr_mode` overlay was
+  needed and `g_ether` was never loaded
+- gadget: `bin/usb-gadget-up status` → `udc=ff400000.usb ifname=usb0
+  net=up`; the UDC went `not attached` → `configured` and the OTG port
+  enumerated to a real host (dmesg `bound driver configfs-gadget.pi_tor`,
+  `new device is high-speed`); `usb0` up `LOWER_UP`, `carrier=1`,
+  `10.12.194.1/24`
+- `pi-tor-gadget`, `pi-tor-stack` and `pi-tor-gadget-watchdog` installed,
+  enabled and active; `tor` and `pihole` healthy, `pi-tor-ui` running
+- end to end over the tether: `dig @10.12.194.1` answered `NOERROR` from the
+  workstation, tor answered `IsTor=true` on its SOCKS port, and a bounded
+  `/32` transparent-HTTPS test went out through a tor exit (`185.220.101.12`)
+  while direct WAN was the ISP address; the host's default route was never
+  touched and the test route was removed
+- `node_exporter.service` keeps `:9100` — same PID and HTTP 200 before and
+  after; this stack never binds it (9050, 9040, 5353, 53, 80, 8080)
+
+Addressing stays with netplan/networkd: `up` writes a runtime-only
+`/run/systemd/network/10-pi-tor-usb0.network` built from
+`PI_TOR_GATEWAY`/`PI_TOR_SUBNET`, so no `/etc` edit and no second copy of
+the gateway value. That file sets `ConfigureWithoutCarrier=yes`: u_ether
+keeps carrier off until the USB host selects the ECM data altsetting, and
+networkd would otherwise never address the link.
+
+### Prerequisites on the board
+
+Two things the repo does not install for you:
+
+1. Docker Engine 24+ with the Compose v2 plugin. On the deployed board they
+   came from Docker's official Debian `trixie`/`arm64` apt repository
+   (`https://download.docker.com/linux/debian`, keyring
+   `/etc/apt/keyrings/docker.asc`; docker-ce 29.9.3 with Compose v2 5.7.0).
+   Confirm with `docker compose version`. The ui service bind-mounts
+   `/usr/bin/docker` and `/usr/libexec/docker/cli-plugins`, which is where
+   that repo installs them; adjust those two volumes if yours differ.
+2. The tracked tree at `/opt/pi-tor` — both units carry literal `/opt/pi-tor`
+   paths, because systemd cannot expand a variable into a path. The deployed
+   install was a `git archive` of the commit, not a clone: there is no `.git`
+   on the board, so re-copy the tree after a repo change instead of `git
+   pull`.
+
+**Check the resolver first.** Pi-hole needs host port 53, and on this Armbian
+image the systemd-resolved stub listener held `127.0.0.53:53` and
+`127.0.0.54:53`, so pihole-FTL refused to start with `failed to create
+listening socket for port 53: Address in use`. The deployment added
+`/etc/systemd/resolved.conf.d/99-pi-tor-no-stub.conf` containing
+`DNSStubListener=no`, repointed `/etc/resolv.conf` at
+`/run/systemd/resolve/resolv.conf`, and backed up the originals; host DNS
+kept working through the LAN resolvers. This is host-specific — check what
+holds :53 before changing it on another board. With the stub listener off
+the host's own name stops resolving synthetically, which made every `sudo`
+call print `unable to resolve host`; the deployment added `rzero` beside
+`radxa-zero` on the `127.0.1.1` line of `/etc/hosts` (also backed up).
+
+### Install and operate
+
+```bash
+# from the repo on your workstation — tracked files only, no .git
+git archive --format=tar.gz --prefix=pi-tor/ HEAD |
+  ssh <board> 'sudo tar -xz -C /opt'
+
+# on the board, in /opt/pi-tor
+sudo cp systemd/pi-tor-gadget.service systemd/pi-tor-stack.service \
+        systemd/pi-tor-gadget-watchdog.service /etc/systemd/system/
+sudo cp -r systemd/pi-tor-gadget-watchdog.service.d /etc/systemd/system/
+sudo cp systemd/pi-tor.env.example /etc/default/pi-tor   # edit if not usb0/10.12.194.x
+sudo systemctl daemon-reload
+sudo systemctl enable --now pi-tor-gadget.service pi-tor-gadget-watchdog.service
+sudo systemctl enable --now pi-tor-stack.service
+
+bin/usb-gadget-up status        # udc=ff400000.usb ifname=usb0 net=up
+docker compose ps               # tor + pihole healthy, pi-tor-ui running
+```
+
+The watchdog drop-in sets `WATCH_RELOAD_CMD=/opt/pi-tor/bin/usb-gadget-up
+rebind`, so a confirmed RX stall re-enumerates the configfs gadget rather
+than reloading `g_ether` (which is not the gadget in use here).
+
+`pi-tor-gadget` is ordered `After=usb-gadget.target` (the target marks the
+UDC hardware being present) and `Before=pi-tor-stack.service`. The stack unit
+carries `Wants=pi-tor-gadget.service` as well as
+`After=pi-tor-gadget.service docker.service`, so enabling only the stack
+still starts the gadget; `Wants` rather than `Requires` means a gadget
+failure is logged instead of holding the stack back, and the UI then
+explains the missing tether. The ui container applies the firewall rules at
+startup, so there is still no separate rules unit.
+
+`up` is idempotent even over a partially torn-down gadget: an unbound but
+composed one is reused, and `ifname` is not rewritten (configfs refuses that
+write while the function is linked). If `PI_TOR_INTERFACE` changed since
+composition, `up` refuses — bound or not, before it touches anything — rather
+than add a second ECM function or repoint the runtime address file, and asks
+for `down` first. `down` removes whichever ECM function is actually linked —
+`PI_TOR_INTERFACE` may have changed since composition — and
+exits nonzero if any gadget state survives, so a failed teardown is never
+reported as success. `bin/usb-gadget-up rebind` rewrites the runtime networkd
+file and settles for a second between unbind and bind, matching the legacy
+reload; it exits nonzero if the netdev does not return, so the watchdog never
+counts a failed re-enumeration as recovery.
+
+`up` only proves the netdev exists; the address needs the host. The RX-stall
+cure in the watchdog chapter is `modprobe -r g_ether && modprobe g_ether`;
+`g_ether` is loadable here, but the gadget is the configfs one, which is why
+the install above ships the rebind drop-in instead.
+
+Verified on the deployed board: the OTG port enumerates while the configfs
+gadget is bound, ECM carrier comes up and the address lands when a host
+attaches, and a real host reached the stack over that link. Still
+**unverified**:
+
+- **Cold boot.** The units are enabled but no reboot was performed, so the
+  boot order (gadget before stack, the runtime networkd file recreated) is
+  untested.
+- **Teardown and rebind.** `down` and `rebind` ran only against the fixture
+  tree; a real configfs teardown/re-enumeration is untested, and the rzero
+  `rebind` path has never been exercised against an actual RX stall (only
+  the Pi Zero 2 W `g_ether` reload has).
+
+### Pi-hole v6 environment variables
+
+`pihole/pihole` 2026.10.1 (Pi-hole v6) ignores the v5 variables this repo used
+to set — `WEBPASSWORD`, `DNSMASQ_LISTENING`, `DNS_QUERY_LOGGING`,
+`PIHOLE_DNS_*` — and no longer reads `/etc/dnsmasq.d`. On the first deployment
+that left FTL on its own defaults (`dns.listeningMode=LOCAL`, empty
+`dns.interface`, upstreams `8.8.8.8,8.8.4.4`), and the password had to be
+applied once with `docker exec -i pihole pihole setpassword`; it persists in
+`/etc/pihole` across restarts (the entrypoint then logs `Password already set
+in config file`).
+
+That v6 fix is now deployed on the board (commit `6bb4752`, applied with
+`docker compose up -d --build pihole ui`). Compose sets the supported keys:
+the password via `FTLCONF_webserver_api_password`, and the DNS policy via
+`FTLCONF_dns_listeningMode=SINGLE`, `FTLCONF_dns_interface`,
+`FTLCONF_dns_upstreams=127.0.0.1#<DNSPort>` and `FTLCONF_dns_queryLogging`
+(EDNS size goes through `FTLCONF_misc_dnsmasq_lines`).
+`FTLCONF_misc_etc_dnsmasq_d` stays off, so no `/etc/dnsmasq.d` file can widen
+the listener or add an upstream; the directory is no longer mounted and the
+old v5 snippets were moved to a root-only backup outside the Compose project.
+A key set this way is **read-only in the Pi-hole web UI**.
+
+Live readback (`pihole-FTL --config <key>`) matches that environment:
+
+    dns.listeningMode  = SINGLE
+    dns.interface      = usb0
+    dns.upstreams      = [ 127.0.0.1#5353 ]
+    dns.queryLogging   = false
+    misc.dnsmasq_lines = [ edns-packet-max=1232 ]
+    misc.etc_dnsmasq_d = false
+
+Startup logged `6 FTLCONF environment variables found (6 used, 0 invalid, 0
+ignored)` and `Assigning password by Environment Variable`, with no random
+password and no `8.8.8.8` fallback. Functionally: queries to the gadget address
+`10.12.194.1` returned real A records, a unique query to the board's LAN
+address `192.168.0.27` timed out from both the tether host and pihole.lan, and
+two 20-second `tcpdump` captures on rzero's uplink interface (`wlan0`), taken
+during fresh queries, saw zero packets to TCP/UDP 53 — no DNS leaves the board
+off the Tor path.
+
+`ss` still shows pihole-FTL on `0.0.0.0:53` and the log says `listening on
+0.0.0.0 port 53`. That is expected, not a leak: `SINGLE` +
+`dns.interface=usb0` becomes dnsmasq `interface=usb0` *without*
+`bind-interfaces`, so dnsmasq binds the wildcard socket and drops queries that
+arrive on any other interface. Judge this setting from the interface-level
+negative/positive test above, never from `ss` or that log line.
+
+Not exercised by this deploy: cold boot, a real watchdog RX-stall recovery, a
+live password change, and the rollback path. `node_exporter` is unchanged
+(`:9100` HTTP 200, same PID) and the `tor` container kept its `StartedAt` and
+restart count; the management surfaces remain separately exposed and
+authenticated as the next paragraph describes.
+
+Both web surfaces are on the LAN, not just the gadget link: the config UI
+answers 401 unauthenticated and 200 with the password, Pi-hole does the same
+for a wrong/correct password, and Pi-hole also binds FTL web TLS on
+`0.0.0.0:443` — a host listener the stack did not previously have. The
+password is the only boundary in front of the ui container's docker socket,
+so treat the board's LAN side as admin-only.
+
+One behaviour is inert: the tor image ships no
+`/usr/share/tor/geoip{,6}`, so `ExcludeExitNodes {ru},{cn},{ir},{kp}` in
+`tor/torrc` is not enforced (tor warns at startup) and exit country cannot be
+constrained until the image includes GeoIP data.
 
 ## Host tether UI (hostui/) — browser toggle + dead-man revert
 
@@ -462,7 +676,6 @@ sudo modprobe -r g_ether && sudo modprobe g_ether   # only for a genuine RX stal
 
 ```
 docker-compose.yml         # Tor + Pi-hole + config-UI stack
-pihole/etc-dnsmasq.d/      # Pi-hole dnsmasq overrides (tracked)
 pihole/etc-pihole/.gitkeep # bind mount placeholder (data ignored)
 tor/                       # Dockerfile + torrc + data dir placeholder
 ui/                        # config UI service: schema -> render -> apply
@@ -474,6 +687,9 @@ hostui/                    # host tether UI: app.py + pi-tor-hostui.service
 systemd/                   # optional stack unit + env example
 bin/gadget-watchdog.sh     # Pi-side g_ether RX-stall watchdog (reloads only
                            # on a confirmed stall, capped 3/hour)
+bin/usb-gadget-up          # configfs ECM gadget up/down/rebind/status
+                           # (Radxa Zero), with pi-tor-gadget.service + the
+                           # watchdog rebind drop-in under systemd/
 bin/usb_host_profile       # host-side static NM profile across re-enumerations
 doc/diagrams/              # generated architecture + sequence plates
 ```

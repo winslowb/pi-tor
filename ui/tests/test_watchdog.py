@@ -67,19 +67,23 @@ RELOAD_STUB = """#!/bin/sh
 printf '%s\\n' "reload $*" >> "$WD_FIXTURE/calls.log"
 exit 0
 """
+RELOAD_FAIL_STUB = RELOAD_STUB.replace("exit 0", "exit 1")
 
 
 class Case:
     """Fixture run of the watchdog: stub commands + fixture sysfs + state."""
 
-    def __init__(self, tethered=True, fail="none", rx_grows=False, fib=True):
+    def __init__(self, tethered=True, fail="none", rx_grows=False, fib=True,
+                 reload_fails=False):
         self.root = Path(tempfile.mkdtemp(prefix="watchdog-test-"))
         self.fixture = self.root
         self.stubbin = self.root / "stubbin"
         self.sysfs = self.root / "sysfs"
         self.stubbin.mkdir()
         for name, text in (("ip", IP_STUB), ("sleep", SLEEP_STUB),
-                           ("probe", PROBE_STUB), ("reload", RELOAD_STUB)):
+                           ("probe", PROBE_STUB),
+                           ("reload", RELOAD_FAIL_STUB if reload_fails
+                            else RELOAD_STUB)):
             p = self.stubbin / name
             p.write_text(text)
             p.chmod(p.stat().st_mode | stat.S_IEXEC)
@@ -212,6 +216,18 @@ class WatchdogDecisionTest(unittest.TestCase):
             "[gadget-watchdog] watchdog on usb0"), res.stdout)
         self.assertEqual(self.cmd_count(case, "reload"), 0)
         self.assertEqual(self.cmd_count(case, "probe"), 2)
+
+    def test_watchdog_logs_a_failed_reload_command(self):
+        """A nonzero reload -- e.g. `usb-gadget-up rebind` when the netdev
+        never returns -- is logged with its rc and still counted, so the
+        consumer of the watchdog's exit status is observable here."""
+        case = Case(tethered=True, fail="all", reload_fails=True)
+        res = case.run(cycles=1)
+        self.assertEqual(res.returncode, 0, res.stderr)
+        joined = "\n".join(self.lines_of(res))
+        self.assertIn("reload command failed (rc=1); monitoring continues",
+                      joined)
+        self.assertIn("RELOADS='1'", case.state())
 
     def test_watchdog_recovery_wait_is_bounded(self):
         """After a reload, resuming waits at most RECOVER_SECONDS (20) for

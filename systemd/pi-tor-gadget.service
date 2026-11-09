@@ -1,0 +1,23 @@
+[Unit]
+Description=pi-tor USB gadget (configfs CDC ECM) on the gadget port
+Documentation=https://github.com/winslowb/pi-tor#radxa-zero-arm64
+# usb-gadget.target marks the UDC hardware being present (WantedBy
+# sys-devices-...-udc-*.device); the gadget itself is composed here. The
+# stack unit is ordered after this one so tor never races the interface.
+After=usb-gadget.target
+Before=pi-tor-stack.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+EnvironmentFile=-/etc/default/pi-tor
+# /opt/pi-tor is the install path the other units assume (ExecStart cannot
+# expand an environment variable into a path). The gadget is composed from
+# PI_TOR_INTERFACE / PI_TOR_GATEWAY / PI_TOR_SUBNET; `up` is idempotent and
+# `down` unbinds the UDC before removing anything.
+ExecStart=/opt/pi-tor/bin/usb-gadget-up up
+ExecStop=/opt/pi-tor/bin/usb-gadget-up down
+TimeoutStartSec=30
+
+[Install]
+WantedBy=multi-user.target
