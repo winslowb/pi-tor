@@ -56,6 +56,8 @@ A minimal Docker stack for a USB-gadget Raspberry Pi that runs Pi-hole as the DN
 
 - Raspberry Pi OS (or any Debian-based distro) with the USB gadget interface
   exposed as `usb0`
+- Radxa Zero on Armbian (`aarch64`) — see [Radxa Zero (ARM64)](#radxa-zero-arm64);
+  the repo ships the configfs gadget bring-up there
 - Docker Engine 24+ with the Compose plugin (`docker compose`)
 - A dedicated IPv4 gadget subnet (defaults to `10.12.194.0/24`)
 - iptables is not needed on the host: the ui image ships it (nft backend,
@@ -153,8 +155,10 @@ The firewall rules need no unit of their own: the ui container applies
 them on start, so `docker compose up` is the only bring-up step. To have
 the stack come up on boot:
 
-1. Copy `systemd/pi-tor.env.example` to `/etc/default/pi-tor` and update
-   `PROJECT_DIR` (any `PI_TOR_*` overrides there feed the stack unit).
+1. Copy `systemd/pi-tor.env.example` to `/etc/default/pi-tor` (any
+   `PI_TOR_*` overrides there feed the units). The units assume the checkout
+   is at `/opt/pi-tor`; if yours is not, edit their `ExecStart`/
+   `WorkingDirectory` paths — systemd cannot expand a variable into a path.
 2. Copy the stack unit:
    ```bash
    sudo cp systemd/pi-tor-stack.service /etc/systemd/system/
@@ -231,6 +235,63 @@ HTML — open them in any browser, no server needed.
 - [`doc/diagrams/pi-tor-sequence.html`](doc/diagrams/pi-tor-sequence.html)
   — one real request: DNS resolve, redirect, circuit, response, with the
   timings measured above. Source: `pi-tor-sequence.candidate.json`.
+## Radxa Zero (ARM64)
+
+The same stack runs on a Radxa Zero (Armbian 26.x, `aarch64`, meson64 kernel)
+with one extra bring-up step. There is no `config.txt` overlay and no
+`g_ether` autoload, so `usb0` never appears on its own: the gadget is composed
+on configfs by `bin/usb-gadget-up` (`systemd/pi-tor-gadget.service`). It
+creates **one CDC ECM function** named `ifname=usb0` — no HID, no mass
+storage — so every existing config (`interface=usb0`, the `10.12.194.1`
+torrc binds, the firewall rules) works unchanged.
+
+Verified read-only on the board (nothing in this repo installs any of it):
+
+- kernel already has `CONFIG_USB_CONFIGFS`, `CONFIG_USB_CONFIGFS_ECM`,
+  `CONFIG_USB_F_ECM`, `CONFIG_USB_LIBCOMPOSITE`, `CONFIG_USB_DWC2=y`
+  (DT `dr_mode=otg`, UDC `ff400000.usb` idle at `state=not attached`) and
+  `CONFIG_NF_TABLES` / `CONFIG_IP_NF_NAT` for the iptables-nft rules the ui
+  container applies
+- Docker Engine 24+ with the compose plugin is **not installed** — the ui
+  service bind-mounts `/usr/bin/docker` and `/usr/libexec/docker/cli-plugins`,
+  so fix those two volumes if your install puts them elsewhere
+- `node_exporter.service` keeps `:9100`; this stack never binds it (9050,
+  9040, 5353, 53, 80, 8080)
+- addressing stays with netplan/networkd: `up` writes a runtime-only
+  `/run/systemd/network/10-pi-tor-usb0.network` built from
+  `PI_TOR_GATEWAY`/`PI_TOR_SUBNET`, so no `/etc` edit and no second copy of
+  the gateway value
+
+Both units expect the checkout at `/opt/pi-tor`.
+
+```bash
+sudo cp systemd/pi-tor-gadget.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable pi-tor-gadget pi-tor-stack
+bin/usb-gadget-up status        # udc=ff400000.usb ifname=usb0 net=up
+```
+
+`pi-tor-gadget` is ordered `After=usb-gadget.target` and
+`Before=pi-tor-stack.service` (the stack unit is also `After=pi-tor-gadget`),
+so tor's gadget-address bind wait never races the interface. `up` is
+idempotent, `down` unbinds the UDC before removing anything, and
+`bin/usb-gadget-up rebind` unbinds + rebinds for a manual re-enumeration.
+
+The RX-stall cure in the watchdog chapter is `modprobe -r g_ether`, which does
+not exist here. Install the rebind drop-in instead, so a confirmed stall
+re-enumerates the configfs gadget:
+
+```bash
+sudo cp -r systemd/pi-tor-gadget-watchdog.service.d /etc/systemd/system/
+sudo systemctl daemon-reload && sudo systemctl restart pi-tor-gadget-watchdog
+```
+
+**Not verified on hardware** (this change made no device writes): whether the
+OTG port enumerates while a gadget is bound to that UDC, and whether a rebind
+clears a real RX stall the way a `g_ether` reload does. The UDC is registered
+and idle, which is the state a bind expects; if the port stays in host role
+when cabled, the board needs a `dr_mode=peripheral` device-tree overlay —
+none ships in `/boot/dtb/amlogic/overlay` today.
 
 ## Host tether UI (hostui/) — browser toggle + dead-man revert
 
@@ -474,6 +535,9 @@ hostui/                    # host tether UI: app.py + pi-tor-hostui.service
 systemd/                   # optional stack unit + env example
 bin/gadget-watchdog.sh     # Pi-side g_ether RX-stall watchdog (reloads only
                            # on a confirmed stall, capped 3/hour)
+bin/usb-gadget-up          # configfs ECM gadget up/down/rebind/status
+                           # (Radxa Zero), with pi-tor-gadget.service + the
+                           # watchdog rebind drop-in under systemd/
 bin/usb_host_profile       # host-side static NM profile across re-enumerations
 doc/diagrams/              # generated architecture + sequence plates
 ```
