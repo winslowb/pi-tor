@@ -44,8 +44,11 @@ services:
     # /etc/dnsmasq.d is no longer read unless FTLCONF_misc_etc_dnsmasq_d=true.
     # That flag stays off on purpose, so these FTLCONF_* keys are the entire
     # DNS policy: listen on the gadget interface only (loopback is implicit in
-    # SINGLE), and forward exclusively to tor's DNSPort. An empty or missing
-    # upstream list resolves nothing rather than falling back to resolv.conf.
+    # SINGLE), and forward exclusively to tor's DNSPort. FTLCONF_dns_upstreams
+    # must stay explicitly set: the v6 entrypoint substitutes Google's public
+    # resolvers when dns.upstreams is empty (src/bash_functions.sh) — exactly
+    # the live board's fallback. FTL emits no-resolv itself, so /etc/resolv.conf
+    # is never consulted either way; the upstream list is the only guard.
     # Every key set here is read-only in the Pi-hole web UI.
     environment:
       TZ: "${PI_TOR_TZ:-UTC}"

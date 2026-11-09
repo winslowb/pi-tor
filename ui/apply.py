@@ -4,9 +4,9 @@ Apply:
 1. back up every file that will change into ui/backups/<UTC-stamp>/ with a
    manifest.json (originals + sha256),
 2. write all render targets atomically (tmp + os.replace, mode preserved),
-3. restart only what changed (tor via socket restart; pihole via socket for
-   dnsmasq changes or compose recreate for env changes; rules script with
-   explicit env overrides),
+3. restart only what changed (tor via socket restart; Pi-hole via compose
+   recreate only — its whole policy is FTLCONF_* container env, nothing is
+   read from dnsmasq.d; rules script with explicit env overrides),
 4. poll container health for 90s and surface logs of a failed restart.
 No auto-rollback: a visible failure beats a silent revert.
 
@@ -70,9 +70,11 @@ def apply_changes(root, posted, dry=None):
 
     restart_tor = "tor/torrc" in changed
 
+    # Key names only, never values: a changed secret still needs its side
+    # effect (the Pi-hole password is FTLCONF_* env, so only a recreate
+    # applies it, even though the value itself must never leave this function).
     diffed_env_keys = [k for k in schema.FIELDS
-                       if before_values.get(k) != cfg[k] and
-                       k not in schema.SECRET_KEYS]
+                       if before_values.get(k) != cfg[k]]
     recreate_pihole = bool(set(diffed_env_keys) & set(PIHOLE_RECREATE_KEYS))
     rules_needed = bool(set(diffed_env_keys) & set(RULES_KEYS))
     ui_note = bool(set(diffed_env_keys) & set(UI_NOTE_KEYS))
@@ -80,10 +82,7 @@ def apply_changes(root, posted, dry=None):
     if restart_tor:
         report["restarts"]["tor"] = _restart_with_health("tor")
     if recreate_pihole:
-        report["restarts"]["pihole"] = dockerops.compose_up(["pihole"], root)
-        if "error" not in report["restarts"]["pihole"]:
-            report["restarts"]["pihole_health"] = \
-                _restart_with_health("pihole", started=False)
+        report["restarts"].update(_recreate_pihole(root))
     if rules_needed:
         report["restarts"]["rules"] = dockerops.run_rules(root, cfg)
     if ui_note:
@@ -126,17 +125,27 @@ def startup_rules_apply(root, dry=None):
 
 def _restart_with_health(name, started=True):
     res = {}
-    res["restart"] = dockerops.restart(name)
-    if "error" in res["restart"]:
-        res["error"] = res["restart"]["error"]
-        res["logs"] = dockerops.logs(name, 50)
-        return res
+    if started:
+        res["restart"] = dockerops.restart(name)
+        if "error" in res["restart"]:
+            res["error"] = res["restart"]["error"]
+            res["logs"] = dockerops.logs(name, 50)
+            return res
     health = dockerops.poll_health(name, 90)
     res["health"] = health
     if not health.get("healthy"):
         res["error"] = f"{name} did not become healthy after restart"
         res["logs"] = dockerops.logs(name, 50)
         res["note"] = "use the Rollback button to restore the previous config"
+    return res
+
+
+def _recreate_pihole(root):
+    """Compose recreate (the only way FTLCONF_* env reaches FTL), then poll
+    health — never a plain restart after it, the fresh container is the point."""
+    res = {"pihole": dockerops.compose_up(["pihole"], root)}
+    if "error" not in res["pihole"]:
+        res["pihole_health"] = _restart_with_health("pihole", started=False)
     return res
 
 
@@ -192,12 +201,13 @@ def restore_latest_backup(root, dry=None):
     restarts = {}
     current = render.read_current(root)
     values = current["values"]
-    if any(r == "tor/torrc" for r in restored):
+    if "tor/torrc" in restored:
         restarts["tor"] = _restart_with_health("tor")
-    if any(r == ".env" for r in restored) and not dry:
-        # env changes need recreate; rules re-applied with restored values
-        restarts.setdefault("pihole_recreate_note",
-                            "restore of .env may need 'docker compose up -d pihole'")
+    if ".env" in restored:
+        # .env carries the whole Pi-hole v6 policy; compose recreation is the
+        # only thing that applies it, then the rules are re-applied with the
+        # restored values. Docker calls short-circuit in dry run.
+        restarts.update(_recreate_pihole(root))
         restarts["rules"] = dockerops.run_rules(root, values)
     return {"ok": True, "backup": str(source), "restored": restored,
             "dry_run": dry, "restarts": restarts}
