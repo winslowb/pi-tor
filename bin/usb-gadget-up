@@ -85,6 +85,14 @@ net_wait() { # bounded wait for the netdevice the bind creates
 }
 
 up() {
+  # Before any mutation, bound or not: a changed PI_TOR_INTERFACE would add a
+  # second ECM function (splitting the gateway from dnsmasq) or repoint the
+  # runtime .network file away from a working gadget.
+  for fn in "$G"/functions/ecm.*; do
+    [ -d "$fn" ] || continue
+    [ "${fn##*/}" = "ecm.$IF" ] ||
+      die "existing ${fn##*/} does not match $IF: run '${0##*/} down' first"
+  done
   if ! is_bound; then
     [ -d "$GADGETFS" ] || "$MODPROBE" libcomposite 2>/dev/null || true
     [ -d "$GADGETFS" ] ||
@@ -99,13 +107,6 @@ up() {
     printf 'pi-tor' > "$G/strings/0x409/manufacturer" || die "cannot write strings"
     printf 'pi-tor ECM gateway' > "$G/strings/0x409/product" || die "cannot write strings"
     printf 'pi-tor' > "$G/strings/0x409/serialnumber" || die "cannot write strings"
-    # A changed PI_TOR_INTERFACE would add a second ECM function and split the
-    # gateway from dnsmasq, so refuse and let the operator tear the old one down.
-    for fn in "$G"/functions/ecm.*; do
-      [ -d "$fn" ] || continue
-      [ "${fn##*/}" = "ecm.$IF" ] ||
-        die "existing ${fn##*/} does not match $IF: run '${0##*/} down' first"
-    done
     mkdir -p "$F" || die "cannot create ECM function $F"
     # configfs rejects ifname with -EBUSY while the function is referenced,
     # and a gadget that was only unbound still has it: keep the name it got.

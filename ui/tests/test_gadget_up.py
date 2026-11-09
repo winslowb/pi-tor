@@ -228,6 +228,22 @@ class GadgetUpTest(unittest.TestCase):
         self.assertEqual(case.attr("UDC"), "\n")
         self.assertNotIn("Name=usb9", case.networkd_file.read_text())
 
+    def test_up_refuses_an_interface_change_while_bound(self):
+        case = Case()
+        self.assertEqual(case.run("up").returncode, 0)
+        before = case.networkd_file.read_text()
+        res = case.run("up", PI_TOR_INTERFACE="usb9")
+        self.assertNotEqual(res.returncode, 0)
+        self.assertIn("existing ecm.usb0 does not match usb9", res.stderr)
+        # the bound gadget must be untouched: same UDC, function and link
+        self.assertEqual(case.attr("UDC"), UDC)
+        self.assertEqual(case.functions(), ["ecm.usb0"])
+        linked = case.g / "configs/c.1/ecm.usb0"
+        self.assertTrue(linked.is_symlink())
+        self.assertEqual(os.readlink(linked), str(case.g / "functions/ecm.usb0"))
+        # and the runtime address file still names the working interface
+        self.assertEqual(case.networkd_file.read_text(), before)
+
     def test_rebind_unbinds_then_rebinds_and_rewrites_the_address_file(self):
         case = Case()
         self.assertEqual(case.run("up").returncode, 0)
