@@ -22,6 +22,7 @@ from test_startup import STUB as IPT_STUB
 SCRIPT = REPO / "bin" / "pi-tor-ap"
 RULES = REPO / "bin" / "pi-tor-rules.sh"
 UNIT = REPO / "systemd" / "pi-tor-ap.service"
+README = REPO / "README.md"
 ENV_EXAMPLE = REPO / "systemd" / "pi-tor-ap.env.example"
 COMPOSE = REPO / "docker-compose.yml"
 TORRC = REPO / "tor" / "torrc"
@@ -59,6 +60,9 @@ case "$*" in
     printf '2: wlan0    inet 192.168.0.188/24 brd 192.168.0.255 scope global wlan0\\n'
     if [ "${AP_TEST_ADDR_CONFLICT:-}" = 1 ]; then
       printf '9: lan0     inet 10.12.195.7/24 brd 10.12.195.255 scope global lan0\\n'
+    fi
+    if [ "${AP_TEST_ADDR_WIDE:-}" = 1 ]; then
+      printf '3: wlan0    inet 10.12.0.5/16 brd 10.12.255.255 scope global wlan0\\n'
     fi
     exit 0 ;;
   "-o -4 addr show dev uap0")
@@ -440,6 +444,66 @@ class ApUpTest(unittest.TestCase):
         self.assertIn("WARNING: rollback incomplete", res.stdout + res.stderr)
 
 
+    def test_env_file_only_sets_allowlisted_keys(self):
+        # Key names, not values: a PI_TOR_* name that is not configured must
+        # never reach the shell's own evaluation, and the internal control
+        # variables (fake root, rules path, the runtime dir) must not be
+        # loadable from a file at all.
+        marker = self.fx.root / "pwned"
+        elsewhere = self.fx.root / "elsewhere"
+        cfg = self.fx.root / "default-pi-tor-ap"
+        cfg.write_text(
+            "PI_TOR_AP_SSID=Guests\n"
+            f"PI_TOR_AP_PSK={PSK}\n"
+            f"PI_TOR_AP_INTERFACE;touch {marker}=x\n"
+            f"PI_TOR_AP_SUBNET`touch {marker}`=x\n"
+            "PI_TOR_FAKE_ROOT=0\n"
+            "PI_TOR_RULES=/nonexistent/pi-tor-rules.sh\n"
+            f"PI_TOR_AP_RUNDIR={elsewhere}\n"
+            "PI_TOR_AP_EVIL=1\n"
+        )
+        res = self.fx.run("up", PI_TOR_AP_ENVFILE=str(cfg), PI_TOR_AP_SSID=None)
+        self.assertEqual(res.returncode, 0, res.stdout + res.stderr)
+        self.assertFalse(marker.exists(), "a key name from the file was evaluated")
+        self.assertIn("ssid=Guests", (self.fx.rundir / "hostapd.conf").read_text())
+        self.assertFalse(elsewhere.exists(), "PI_TOR_AP_RUNDIR was taken from the file")
+        self.assertIsNotNone(self.fx.chain("nat", "PI_TOR_AP_REDIRECT"),
+                             "the rules path was taken from the file")
+
+    def test_up_refuses_a_gateway_outside_the_ap_subnet(self):
+        # the DHCP network has to be the firewall's source subnet, so the
+        # subnet decides it; a gateway-derived network would validate itself
+        res = self.fx.run("up", PI_TOR_AP_GATEWAY="10.12.196.1")
+        self.assertNotEqual(res.returncode, 0)
+        self.assertIn("is not inside PI_TOR_AP_SUBNET", res.stderr)
+        self.assertFalse((self.fx.net / "uap0").exists())
+        self.assertIsNone(self.fx.chain("nat", "PI_TOR_AP_REDIRECT"))
+        self.assertFalse(self.fx.rundir.exists())
+
+    def test_up_refuses_a_subnet_inside_a_wider_uplink_route(self):
+        # no address string matches 10.12.195.0/24, but this host's /16 covers
+        # it: only a CIDR overlap check sees that
+        res = self.fx.run("up", AP_TEST_ADDR_WIDE="1")
+        self.assertNotEqual(res.returncode, 0)
+        self.assertIn("already configured on this host", res.stderr)
+        self.assertIn("10.12.0.5/16", res.stderr)
+        self.assertFalse((self.fx.net / "uap0").exists())
+        self.assertIsNone(self.fx.chain("nat", "PI_TOR_AP_REDIRECT"))
+
+    def test_a_rundir_that_is_not_its_own_is_refused_and_never_removed(self):
+        # `down` runs rm -rf on this path, so production may only use the
+        # directory the script owns (a fake-root fixture is the exception)
+        broad = self.fx.root / "broad"
+        broad.mkdir()
+        (broad / "keep").write_text("x")
+        for action in ("down", "up"):
+            res = self.fx.run(action, PI_TOR_AP_RUNDIR=str(broad), PI_TOR_FAKE_ROOT=None)
+            self.assertNotEqual(res.returncode, 0, action)
+            self.assertIn("must be /run/pi-tor-ap", res.stderr, action)
+        self.assertTrue((broad / "keep").exists(),
+                        "a directory the script does not own was removed")
+
+
 class ApRulesTest(unittest.TestCase):
 
     def setUp(self):
@@ -642,6 +706,33 @@ class ApPolicyTest(unittest.TestCase):
         self.assertIn("ExecStop=/opt/pi-tor/bin/pi-tor-ap down", text)
         # a failed AP start stays failed and visible instead of restart-looping
         self.assertIn("Restart=no", text)
+
+
+class ApReadmeTest(unittest.TestCase):
+    """The AP procedure has to be runnable as written: a unit that is enabled
+    but never installed, or a distro unit apt starts because it was masked too
+    late, is a documented failure rather than a papercut."""
+
+    def section(self):
+        text = README.read_text()
+        start = text.index("## Wi-Fi AP (guest) mode")
+        return text[start:text.index("\n## ", start + 1)]
+
+    def test_the_unit_is_installed_and_reloaded_before_it_is_enabled(self):
+        sec = self.section()
+        install = sec.index("systemd/pi-tor-ap.service /etc/systemd/system/")
+        reload_ = sec.index("systemctl daemon-reload")
+        enable = sec.index("systemctl enable --now pi-tor-ap.service")
+        self.assertLess(install, reload_, "daemon-reload must follow the unit install")
+        self.assertLess(reload_, enable, "enable --now needs the unit on disk first")
+
+    def test_the_distro_units_are_masked_before_apt_can_start_them(self):
+        sec = self.section()
+        stop = sec.index("systemctl stop dnsmasq.service hostapd.service")
+        mask = sec.index("systemctl mask dnsmasq.service hostapd.service")
+        install = sec.index("apt install hostapd")
+        self.assertLess(stop, mask, "an already-running unit is stopped before it is masked")
+        self.assertLess(mask, install, "apt starts both units as it installs them: mask first")
 
 
 if __name__ == "__main__":

@@ -36,12 +36,28 @@ set -u
 log() { printf '[pi-tor-ap] %s\n' "$*"; }
 die() { printf '[pi-tor-ap] %s\n' "$*" >&2; exit 1; }
 
+# The keys a file may set: exactly what this script consumes, nothing else. An
+# internal control variable or a test seam (PI_TOR_FAKE_ROOT, PI_TOR_RULES,
+# PI_TOR_AP_RUNDIR, PI_TOR_IW, ...) must not be loadable from a file on disk.
+env_key_ok() { # <name>
+  case $1 in
+    PI_TOR_AP_INTERFACE | PI_TOR_AP_SUBNET | PI_TOR_AP_GATEWAY | \
+    PI_TOR_AP_SSID | PI_TOR_AP_PSK | PI_TOR_AP_DHCP_START | \
+    PI_TOR_AP_DHCP_END | PI_TOR_AP_WAIT | PI_TOR_UPLINK | \
+    PI_TOR_INTERFACE | PI_TOR_SUBNET | PI_TOR_GATEWAY | \
+    PI_TOR_TRANS_PORT | PI_TOR_PIHOLE_PORT) return 0 ;;
+  esac
+  return 1
+}
+
 # Read KEY=VALUE lines without running anything. systemd loads
 # /etc/default/pi-tor-ap for the unit, but a manual `sudo bin/pi-tor-ap up`
 # would otherwise start with an empty SSID/PSK -- and the only way left to
 # supply them would be an argv every user on the box can read in `ps`. Only
-# PI_TOR_* keys are honoured and an already-set variable wins, so the unit's
-# EnvironmentFile keeps precedence and the file cannot set anything else.
+# allowlisted keys are honoured and an already-set variable wins, so the
+# unit's EnvironmentFile keeps precedence and the file cannot set anything
+# else. `printenv` rather than an eval'd indirect expansion: a key name from
+# the file never reaches the shell's parser.
 load_env_file() { # <path>
   [ -r "${1:-}" ] || return 0
   cr=$(printf '\r')
@@ -52,14 +68,16 @@ load_env_file() { # <path>
     case $line in *=*) ;; *) log "ignoring malformed line in $1: no '='" ; continue ;; esac
     key=${line%%=*}
     val=${line#*=}
-    case $key in PI_TOR_*) ;; *) continue ;; esac
+    if ! env_key_ok "$key"; then
+      case $key in PI_TOR_*) log "ignoring unsupported key in $1: $key" ;; esac
+      continue
+    fi
     case $val in
       \"*\") val=${val#\"}; val=${val%\"} ;;
       \'*\') val=${val#\'}; val=${val%\'} ;;
       *) val=${val%"${val##*[![:space:]]}"} ;;   # systemd strips unquoted trailing space
     esac
-    eval "have=\${$key+1}"
-    [ "${have:-}" = 1 ] && continue
+    printenv "$key" >/dev/null 2>&1 && continue   # the unit's env wins
     export "$key=$val"
   done < "$1"
 }
@@ -72,7 +90,8 @@ AP_GW=${PI_TOR_AP_GATEWAY:-10.12.195.1}
 SSID=${PI_TOR_AP_SSID:-}
 PSK=${PI_TOR_AP_PSK:-}
 UPLINK=${PI_TOR_UPLINK:-wlan0}
-RUNDIR=${PI_TOR_AP_RUNDIR:-/run/pi-tor-ap}
+DEFAULT_RUNDIR=/run/pi-tor-ap
+RUNDIR=${PI_TOR_AP_RUNDIR:-$DEFAULT_RUNDIR}
 NET_DIR=${PI_TOR_NET_DIR:-/sys/class/net}
 SYSCTL_DIR=${PI_TOR_AP_SYSCTL_DIR:-/proc/sys/net/ipv6/conf}
 IW=${PI_TOR_IW:-iw}
@@ -86,7 +105,10 @@ TRANS_PORT=${PI_TOR_TRANS_PORT:-9040}
 PIHOLE_PORT=${PI_TOR_PIHOLE_PORT:-53}
 
 PREFIX=${AP_SUBNET#*/}
-NET=${AP_GW%.*}
+# the /24 the AP owns, taken from the subnet itself: deriving it from the
+# gateway would check a gateway outside the subnet against itself
+NET=${AP_SUBNET%/*}
+NET=${NET%.*}
 DHCP_START=${PI_TOR_AP_DHCP_START:-$NET.100}
 DHCP_END=${PI_TOR_AP_DHCP_END:-$NET.199}
 HOSTAPD_CONF=$RUNDIR/hostapd.conf
@@ -129,6 +151,28 @@ uplink_channel() {
 
 hw_mode() { # 2.4 GHz channels are g, 5 GHz are a
   if [ "$1" -le 14 ]; then echo g; else echo a; fi
+}
+
+# true when two IPv4 CIDRs share any address. The AP is a /24, and a wider
+# connected route (an uplink on 10.12.0.5/16) covers it without any address
+# string matching it, so the comparison has to be on networks.
+cidr_overlap() { # <cidr> <cidr>
+  printf '%s\n%s\n' "$1" "$2" | awk -F '[/.]' '
+    NF == 5 {
+      size = 2 ^ (32 - $5)
+      start[NR] = int(($1 * 16777216 + $2 * 65536 + $3 * 256 + $4) / size) * size
+      end[NR] = start[NR] + size - 1
+      ok++
+    }
+    END { exit !(ok == 2 && start[1] <= end[2] && start[2] <= end[1]) }'
+}
+
+# `down` runs `rm -rf` here, so in production it may only be the directory this
+# script owns; a fake-root fixture (the test suite) may point it elsewhere.
+rundir_ok() {
+  [ "${PI_TOR_FAKE_ROOT:-}" = 1 ] && return 0
+  [ "$RUNDIR" = "$DEFAULT_RUNDIR" ] ||
+    die "PI_TOR_AP_RUNDIR ($RUNDIR) must be $DEFAULT_RUNDIR: 'down' deletes it, so no other path is safe"
 }
 
 host_in_net() { # <address> <setting>: a usable host in $NET/24; sets LAST
@@ -200,10 +244,7 @@ validate() {
   if [ "$AP_IF" = "${PI_TOR_INTERFACE:-usb0}" ]; then
     die "PI_TOR_AP_INTERFACE must differ from PI_TOR_INTERFACE (${PI_TOR_INTERFACE:-usb0}): the tether rules own that interface"
   fi
-  # `down` removes this directory, so never let it point at something real
-  case "$RUNDIR" in
-    '' | /) die "PI_TOR_AP_RUNDIR must be a dedicated directory (got '$RUNDIR')" ;;
-  esac
+  rundir_ok
 }
 
 preflight() {
@@ -211,12 +252,15 @@ preflight() {
   [ -e "$NET_DIR/$UPLINK" ] || die "uplink $UPLINK does not exist under $NET_DIR"
   # A /24 the board already answers on would put guests on a LAN subnet, where
   # their traffic is neither DNAT'ed nor dropped ahead of the LAN's own path.
+  command -v awk >/dev/null 2>&1 ||
+    die "awk is missing: the AP subnet cannot be checked against this host's addresses"
   addrs=$("$IP" -o -4 addr show 2>/dev/null || true)
-  case $addrs in
-    *"inet $NET."*)
-      die "PI_TOR_AP_SUBNET ($AP_SUBNET) is already configured on this host: pick a /24 this board is not on"
-      ;;
-  esac
+  for cidr in $(printf '%s\n' "$addrs" |
+    awk '{ for (i = 1; i < NF; i++) if ($i == "inet") { print $(i + 1); break } }'); do
+    if cidr_overlap "$NET.0/$PREFIX" "$cidr"; then
+      die "PI_TOR_AP_SUBNET ($AP_SUBNET) is already configured on this host ($cidr): pick a /24 this board is not on"
+    fi
+  done
   CHANNEL=$(uplink_channel)
   [ -n "$CHANNEL" ] || die "cannot read $UPLINK's channel from 'iw dev $UPLINK info': one radio means the AP has to share the uplink's channel, and there is no safe default"
   HWMODE=$(hw_mode "$CHANNEL")
@@ -416,6 +460,7 @@ up() {
 }
 
 down() {
+  rundir_ok   # before anything is removed: the path is the destructive part
   require_root
   stop_daemons
   if [ -e "$NET_DIR/$AP_IF" ]; then

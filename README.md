@@ -202,7 +202,7 @@ listening on a stale address, and both fail silently.
 - **Dry run.** `PI_TOR_UI_DRY_RUN=1` skips Docker/socket/firewall actions, but
   apply and rollback still write rendered files and backups; it is not a
   no-write preview. Use `/api/preview` for a diff that writes nothing.
-- Tests: `python3 -m unittest discover -s ui/tests` (134 tests, stdlib only).
+- Tests: `python3 -m unittest discover -s ui/tests` (152 tests, stdlib only).
   Details in [ui/README.md](ui/README.md).
 
 **Security boundary, stated plainly:** the ui container mounts
@@ -669,6 +669,8 @@ helper, not a second gateway: `bin/pi-tor-ap` owns the link,
 ```bash
 sudo install -m 0600 systemd/pi-tor-ap.env.example /etc/default/pi-tor-ap
 sudoedit /etc/default/pi-tor-ap           # SSID + PI_TOR_AP_PSK (8-63 chars)
+sudo install -m 0644 systemd/pi-tor-ap.service /etc/systemd/system/
+sudo systemctl daemon-reload              # the enable below needs it on disk
 sudo bin/pi-tor-ap plan                   # what it would do; changes nothing
 sudo bin/pi-tor-ap up                     # then check from a phone
 sudo bin/pi-tor-ap down                   # stops daemons, deletes the AP
@@ -678,18 +680,23 @@ sudo systemctl enable --now pi-tor-ap.service   # optional: start on boot
 
 `up` and `plan` read `/etc/default/pi-tor-ap` themselves (`PI_TOR_AP_ENVFILE`
 overrides the path) with a plain `KEY=VALUE` reader: nothing is executed and
-only `PI_TOR_*` keys are taken, so a manual run never needs the passphrase on
-the command line where `ps` would show it. Values already in the environment
+only the keys it configures are taken — an unsupported `PI_TOR_*` name (or an
+internal one such as `PI_TOR_RULES`) is ignored and logged, so a manual run
+never needs the passphrase on the command line where `ps` would show it. Values already in the environment
 win, which is what the unit's `EnvironmentFile` supplies.
 
 Host packages: `hostapd`, `dnsmasq` and `iw` on Armbian. The distro units must
 not run alongside the AP — `dnsmasq.service` would take `:53` away from
-Pi-hole, and `hostapd.service` would fight for the radio — and apt starts both
-as it installs them. Mask them in the same session, before starting the AP:
+Pi-hole, and `hostapd.service` would fight for the radio — and **apt starts
+both as it installs them**. So stop anything a previous install left running,
+mask them, and only then install:
 
 ```bash
-sudo apt install hostapd dnsmasq iw
-sudo systemctl mask --now dnsmasq.service hostapd.service
+# no-op when the units are not installed yet; covers an older install
+sudo systemctl stop dnsmasq.service hostapd.service 2>/dev/null || true
+# mask works before the units exist: it just creates the /dev/null links
+sudo systemctl mask dnsmasq.service hostapd.service
+sudo apt install hostapd dnsmasq iw      # apt can no longer start either one
 ```
 
 Masking is required, not tidiness: an unmasked `dnsmasq.service` means a second
@@ -761,10 +768,11 @@ Constraints that cannot be designed around:
   visible failure beats a restart loop with guests on a half-configured AP.
 - **Preflight refuses what would mis-serve guests.** `up` rejects a gateway,
   DHCP start or DHCP end that is not a usable host in the AP `/24` (`.0`,
-  `.255`), a pool that is inverted or that contains the gateway, an AP `/24`
-  the board already has an address in (so the uplink LAN and the guest network
-  cannot overlap), any overlap with the tether subnet, and — with `ss`
-  available — a host where nothing listens on Pi-hole's `:53` or tor's
+  `.255`), a pool that is inverted or that contains the gateway, a subnet that
+  does not contain the gateway, an AP `/24` that overlaps any address *or
+  connected route* the board already has (an uplink on a wider `/16` covers the
+  guest `/24` without any address matching it), any overlap with the tether
+  subnet, and — with `ss` available — a host where nothing listens on Pi-hole's `:53` or tor's
   TransPort, which would leave guests with a lease and no way out.
 - **Management stays on the tether.** Guests cannot reach the Pi's admin
   ports at all; manage the board over `usb0` or the LAN as before.
