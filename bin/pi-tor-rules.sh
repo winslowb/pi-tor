@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # pi-tor-rules.sh
 # helper that wires the usb gadget interface through the Tor
-# transparent proxy (TransPort/DNSPort) exposed by the docker-compose stack.
+# transparent proxy (TransPort/DNSPort) exposed by the docker-compose stack,
+# plus the optional Wi-Fi AP (guest) path: apply-ap / flush-ap.
 
 set -euo pipefail
 
@@ -17,6 +18,17 @@ if [[ "$SUBNET_BITS" == "$SUBNET" ]]; then
   SUBNET_BITS=24
 fi
 GATEWAY_CIDR="${GATEWAY_IP}/${SUBNET_BITS}"
+
+# Wi-Fi AP (guest) mode, driven by bin/pi-tor-ap. Off unless an interface name
+# is given, so every tether-only call is unchanged. These rules DNAT rather
+# than REDIRECT: REDIRECT rewrites the destination to the incoming interface's
+# own address, where neither Pi-hole (:53) nor TransPort (:9040) is bound.
+# DNAT to the Pi's tether address reaches both listeners without widening
+# either one (Pi-hole keeps its SINGLE-interface policy).
+AP_INTERFACE="${PI_TOR_AP_INTERFACE:-}"
+AP_CHAIN="${PI_TOR_AP_CHAIN:-PI_TOR_AP_REDIRECT}"
+AP_IN_CHAIN="${PI_TOR_AP_IN_CHAIN:-PI_TOR_AP_IN}"
+PIHOLE_PORT="${PI_TOR_PIHOLE_PORT:-53}"
 
 # Protected hosts: IPv4 addresses traffic to which must never be diverted
 # into tor (SSH :22, Pi-hole :80 and the config UI :8080 live on this host).
@@ -69,6 +81,45 @@ filter_rules() {
   printf '%s\n' "-i $INTERFACE -p udp ! --dport 53 -j DROP"
 }
 
+ap_chain_rules() {
+  # No RETURN rules here, unlike the tether chain: a RETURN for the gateway
+  # would let a guest reach the Pi's own services by IP (Pi-hole admin on :80,
+  # this UI on :8080). The AP input chain's final DROP is what keeps it
+  # guest-only.
+  printf '%s\n' "-p udp --dport $PIHOLE_PORT -j DNAT --to-destination ${GATEWAY_IP}:${PIHOLE_PORT}"
+  printf '%s\n' "-p tcp --dport $PIHOLE_PORT -j DNAT --to-destination ${GATEWAY_IP}:${PIHOLE_PORT}"
+  printf '%s\n' "-p tcp -j DNAT --to-destination ${GATEWAY_IP}:${TOR_TRANS_PORT}"
+}
+
+ap_filter_rules() {
+  # The ACCEPTs are the only exits from this chain; the trailing DROP catches
+  # QUIC and every other non-DNS UDP, ICMP, mDNS, a guest reaching the Pi's
+  # admin ports, and any protocol that is neither TCP nor DNS. DHCP is udp/67
+  # on this interface only (bin/pi-tor-ap's dnsmasq binds nowhere else).
+  printf '%s\n' "-i $AP_INTERFACE -p udp -d $GATEWAY_IP --dport $PIHOLE_PORT -j ACCEPT"
+  printf '%s\n' "-i $AP_INTERFACE -p tcp -d $GATEWAY_IP --dport $PIHOLE_PORT -j ACCEPT"
+  printf '%s\n' "-i $AP_INTERFACE -p udp --dport 67 -j ACCEPT"
+  printf '%s\n' "-i $AP_INTERFACE -p tcp -d $GATEWAY_IP --dport $TOR_TRANS_PORT -j ACCEPT"
+  printf '%s\n' "-i $AP_INTERFACE -j DROP"
+}
+
+show_ap_rules() {
+  [[ -n "$AP_INTERFACE" ]] || return 0
+  local ipt="${IPTABLES_BIN:-iptables}" ip6t="${IP6TABLES_BIN:-ip6tables}" rule
+  echo "# AP mode (${AP_INTERFACE}): guest DNS and TCP leave through the Pi's own listeners, everything else is dropped"
+  while IFS= read -r rule; do
+    printf '%s\n' "$ipt -t nat -A $AP_CHAIN $rule"
+  done < <(ap_chain_rules)
+  printf '%s\n' "$ipt -t nat -A PREROUTING -i $AP_INTERFACE -j $AP_CHAIN"
+  while IFS= read -r rule; do
+    printf '%s\n' "$ipt -t filter -A $AP_IN_CHAIN $rule"
+  done < <(ap_filter_rules)
+  printf '%s\n' "$ipt -t filter -A INPUT -i $AP_INTERFACE -j $AP_IN_CHAIN"
+  printf '%s\n' "$ipt -t filter -A FORWARD -i $AP_INTERFACE -j DROP"
+  printf '%s\n' "$ip6t -t filter -A INPUT -i $AP_INTERFACE -j DROP"
+  printf '%s\n' "$ip6t -t filter -A FORWARD -i $AP_INTERFACE -j DROP"
+}
+
 show_rules() {
   local ipt="${IPTABLES_BIN:-iptables}"
   echo "# bin/pi-tor-rules.sh would apply (no changes made); protected hosts never enter tor"
@@ -84,6 +135,7 @@ show_rules() {
     printf '%s\n' "$ipt -t filter -A $chain -i $INTERFACE -s $SUBNET -j ACCEPT"
   done
   printf '%s\n' "$ipt -t filter -A FORWARD -o $INTERFACE -d $SUBNET -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT"
+  show_ap_rules
 }
 
 resolve_iptables() {
@@ -97,7 +149,21 @@ resolve_iptables() {
   fi
 }
 
+resolve_ip6tables() {
+  if command -v ip6tables-nft >/dev/null 2>&1; then
+    command -v ip6tables-nft
+  elif command -v ip6tables >/dev/null 2>&1; then
+    command -v ip6tables
+  else
+    # Fail closed: without ip6tables a guest keeps its link-local address and
+    # any IPv6 path the rest of the network offers would bypass the v4 rules.
+    echo "[pi-tor] refusing to apply AP rules: ip6tables(8) not found, so guest IPv6 could not be blocked" >&2
+    exit 1
+  fi
+}
+
 IPTABLES_BIN="${IPTABLES_BIN:-}"
+IP6TABLES_BIN="${IP6TABLES_BIN:-}"
 
 log() { printf '[pi-tor] %s\n' "$*"; }
 
@@ -137,6 +203,35 @@ delete_rule_if_present() {
   done
 }
 
+add6_rule_if_missing() {
+  local table="$1"; shift
+  if ! "$IP6TABLES_BIN" -t "$table" -C "$@" >/dev/null 2>&1; then
+    "$IP6TABLES_BIN" -t "$table" -A "$@" >/dev/null
+  fi
+}
+
+delete6_rule_if_present() {
+  local table="$1"; shift
+  while "$IP6TABLES_BIN" -t "$table" -C "$@" >/dev/null 2>&1; do
+    "$IP6TABLES_BIN" -t "$table" -D "$@" >/dev/null || true
+  done
+}
+
+chain_reset() { # <table> <chain>: create it, or empty it in place
+  if ! "$IPTABLES_BIN" -t "$1" -L "$2" >/dev/null 2>&1; then
+    "$IPTABLES_BIN" -t "$1" -N "$2"
+  else
+    "$IPTABLES_BIN" -t "$1" -F "$2"
+  fi
+}
+
+chain_drop() { # <table> <chain>: remove a chain this script created, if present
+  if "$IPTABLES_BIN" -t "$1" -L "$2" >/dev/null 2>&1; then
+    "$IPTABLES_BIN" -t "$1" -F "$2"
+    "$IPTABLES_BIN" -t "$1" -X "$2"
+  fi
+}
+
 apply_rules() {
   require_root
   # No sysctl writes here: this script now runs inside the ui container on
@@ -146,11 +241,7 @@ apply_rules() {
   # ip_forward is irrelevant; ICMP is not redirected at all).
 
   log "Configuring NAT redirect chain (${CHAIN})"
-  if ! "$IPTABLES_BIN" -t nat -L "$CHAIN" >/dev/null 2>&1; then
-    "$IPTABLES_BIN" -t nat -N "$CHAIN"
-  else
-    "$IPTABLES_BIN" -t nat -F "$CHAIN"
-  fi
+  chain_reset nat "$CHAIN"
 
   log "Protecting ${PROTECTED_HOSTS} from the redirect (RETURN first)"
   while IFS= read -r rule; do
@@ -212,12 +303,78 @@ flush_rules() {
   delete_rule_if_present filter FORWARD -o "$INTERFACE" -d "$SUBNET" -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
 }
 
+require_ap_interface() {
+  if [[ -z "$AP_INTERFACE" ]]; then
+    echo "[pi-tor] PI_TOR_AP_INTERFACE is empty: there is no AP interface to $ACTION" >&2
+    exit 64
+  fi
+  if [[ "$AP_INTERFACE" == "$INTERFACE" ]]; then
+    echo "[pi-tor] PI_TOR_AP_INTERFACE ($AP_INTERFACE) must differ from PI_TOR_INTERFACE ($INTERFACE): guest rules and tether rules would share one interface" >&2
+    exit 64
+  fi
+}
+
+apply_ap_rules() {
+  require_root
+  require_ap_interface
+
+  log "AP mode: guest DNS goes to Pi-hole ${GATEWAY_IP}:${PIHOLE_PORT}, guest TCP to tor ${GATEWAY_IP}:${TOR_TRANS_PORT} (${AP_CHAIN})"
+  chain_reset nat "$AP_CHAIN"
+  local rule
+  while IFS= read -r rule; do
+    "$IPTABLES_BIN" -t nat -A "$AP_CHAIN" $rule
+  done < <(ap_chain_rules)
+  add_rule_if_missing nat PREROUTING -i "$AP_INTERFACE" -j "$AP_CHAIN"
+
+  log "AP mode: ${AP_INTERFACE} is guest-only (DNS, DHCP, tor-TransPort, then DROP; no forwarding, no IPv6)"
+  chain_reset filter "$AP_IN_CHAIN"
+  while IFS= read -r rule; do
+    "$IPTABLES_BIN" -t filter -A "$AP_IN_CHAIN" $rule
+  done < <(ap_filter_rules)
+  add_rule_if_missing filter INPUT -i "$AP_INTERFACE" -j "$AP_IN_CHAIN"
+  add_rule_if_missing filter FORWARD -i "$AP_INTERFACE" -j DROP
+  # Guests are never routed anywhere by this host: tor captures their TCP.
+  add6_rule_if_missing filter INPUT -i "$AP_INTERFACE" -j DROP
+  add6_rule_if_missing filter FORWARD -i "$AP_INTERFACE" -j DROP
+}
+
+flush_ap_rules() {
+  require_root
+  require_ap_interface
+
+  log "AP mode: removing hooks and chains for ${AP_INTERFACE}"
+  delete_rule_if_present nat PREROUTING -i "$AP_INTERFACE" -j "$AP_CHAIN"
+  delete_rule_if_present filter INPUT -i "$AP_INTERFACE" -j "$AP_IN_CHAIN"
+  delete_rule_if_present filter FORWARD -i "$AP_INTERFACE" -j DROP
+  chain_drop nat "$AP_CHAIN"
+  chain_drop filter "$AP_IN_CHAIN"
+
+  # Teardown must not need a binary that was never there: only resolve
+  # ip6tables when it exists, because a missing one means nothing was added.
+  if [[ -z "$IP6TABLES_BIN" ]]; then
+    IP6TABLES_BIN="$(command -v ip6tables-nft || command -v ip6tables || true)"
+  fi
+  if [[ -n "$IP6TABLES_BIN" ]]; then
+    delete6_rule_if_present filter INPUT -i "$AP_INTERFACE" -j DROP
+    delete6_rule_if_present filter FORWARD -i "$AP_INTERFACE" -j DROP
+  fi
+}
+
 case "$ACTION" in
   apply)
     validate_protected_hosts
     refuse_unprotected_gateway
     [[ -n "$IPTABLES_BIN" ]] || IPTABLES_BIN="$(resolve_iptables)"
     apply_rules
+    ;;
+  apply-ap)
+    [[ -n "$IPTABLES_BIN" ]] || IPTABLES_BIN="$(resolve_iptables)"
+    [[ -n "$IP6TABLES_BIN" ]] || IP6TABLES_BIN="$(resolve_ip6tables)"
+    apply_ap_rules
+    ;;
+  flush-ap)
+    [[ -n "$IPTABLES_BIN" ]] || IPTABLES_BIN="$(resolve_iptables)"
+    flush_ap_rules
     ;;
   flush)
     [[ -n "$IPTABLES_BIN" ]] || IPTABLES_BIN="$(resolve_iptables)"
@@ -228,7 +385,7 @@ case "$ACTION" in
     show_rules
     ;;
   *)
-    echo "Usage: $0 [apply|flush|show-rules]" >&2
+    echo "Usage: $0 [apply|flush|apply-ap|flush-ap|show-rules]" >&2
     exit 64
     ;;
 esac

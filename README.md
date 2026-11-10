@@ -202,7 +202,7 @@ listening on a stale address, and both fail silently.
 - **Dry run.** `PI_TOR_UI_DRY_RUN=1` skips Docker/socket/firewall actions, but
   apply and rollback still write rendered files and backups; it is not a
   no-write preview. Use `/api/preview` for a diff that writes nothing.
-- Tests: `python3 -m unittest discover -s ui/tests` (119 tests, stdlib only).
+- Tests: `python3 -m unittest discover -s ui/tests` (134 tests, stdlib only).
   Details in [ui/README.md](ui/README.md).
 
 **Security boundary, stated plainly:** the ui container mounts
@@ -659,6 +659,82 @@ eem). Requires NetworkManager >= 1.14. `--dry-run` prints the exact
 profile named `pi-tor-gadget` already exists unless `--force`
 (delete + re-add); `--remove` takes the profile back out.
 
+## Wi-Fi AP (guest) mode
+
+Nearby devices can join an authenticated SSID and get Pi-hole DNS plus
+tor-only egress — nothing else. It is a second mode of the existing firewall
+helper, not a second gateway: `bin/pi-tor-ap` owns the link,
+`bin/pi-tor-rules.sh apply-ap|flush-ap` owns the policy.
+
+```bash
+sudo install -m 0600 systemd/pi-tor-ap.env.example /etc/default/pi-tor-ap
+sudoedit /etc/default/pi-tor-ap           # SSID + PI_TOR_AP_PSK (8-63 chars)
+sudo bin/pi-tor-ap plan                   # what it would do; changes nothing
+sudo bin/pi-tor-ap up                     # then check from a phone
+sudo bin/pi-tor-ap down                   # stops daemons, deletes the AP
+                                          # interface, flushes the AP rules
+sudo systemctl enable --now pi-tor-ap.service   # optional: start on boot
+```
+
+Host packages: `hostapd`, `dnsmasq` and `iw` (Armbian:
+`sudo apt install hostapd dnsmasq iw`; tor, Pi-hole and the tether are
+unchanged).
+
+What guests get:
+
+- **Authenticated WPA2-PSK only.** The script writes `wpa=2` /
+  `wpa_key_mgmt=WPA-PSK`; there is no open, WEP or enterprise mode and no
+  default secret — `up` refuses an empty or too-short `PI_TOR_AP_PSK`. The
+  rendered `hostapd.conf` (the one file holding the passphrase) lives in
+  `/run/pi-tor-ap` (dir 0700, file 0600) and `down` removes it. The committed
+  `systemd/pi-tor-ap.env.example` ships the key empty and is not one of the
+  UI's render targets, so the secret never reaches `.env` or the repo.
+- **DHCP from a dnsmasq bound to the AP interface only.** `port=0` means it is
+  not a second resolver; `interface=` plus `bind-dynamic` means nothing is
+  served on the uplink or the tether. The pool defaults to `.100-.199` of the
+  AP subnet, which must be a `/24` (the arithmetic assumes one).
+- **Pi-hole DNS, without widening Pi-hole.** Guest `udp/tcp 53` is DNAT'ed to
+  `PI_TOR_GATEWAY:53`. Pi-hole keeps its `FTLCONF_dns_interface` (the tether
+  interface, `SINGLE`) and its tor-only upstream: no second listener, no
+  extra dnsmasq line, nothing exposed on the uplink.
+- **TCP only through tor.** All guest TCP is DNAT'ed to
+  `PI_TOR_GATEWAY:PI_TOR_TRANS_PORT`, i.e. into tor's TransPort. DNAT rather
+  than REDIRECT on purpose: a REDIRECT would land on the AP interface's own
+  address, where neither Pi-hole nor TransPort is bound.
+- **Everything else dropped** by the guest input chain's trailing `-j DROP`:
+  non-DNS UDP (QUIC, mDNS), ICMP, and any attempt to reach SSH :22, Pi-hole
+  :80 or the config UI :8080 on the Pi. `FORWARD` from the guest interface is
+  dropped outright, and `ip6tables` drops it in `INPUT` and `FORWARD`
+  (`disable_ipv6` is set on the interface as well) — `apply-ap` refuses to run
+  at all when `ip6tables` is missing instead of leaving an IPv6 path open.
+- **Client isolation.** `ap_isolate=1` in `hostapd.conf`, plus that forwarding
+  drop.
+
+Constraints that cannot be designed around:
+
+- **One radio, one channel.** `iw phy` on the deployed board allows one AP plus
+  one managed station only with `#channels <= 1`, so the AP has to sit on the
+  uplink's current channel (149 on the board today). The script reads that
+  channel from the live uplink and refuses when it cannot; after an uplink
+  channel change, run `pi-tor-ap down && pi-tor-ap up`. A wired uplink has no
+  channel to share and is refused.
+- **Startup is fail-closed and atomic.** The rules are applied *before* the
+  interface is usable, so there is no window in which a guest can associate
+  unfiltered. Any later failure (hostapd rejecting the channel, dnsmasq
+  failing to start, the uplink losing its association) tears the whole AP back
+  down and exits nonzero. `pi-tor-ap.service` sets `Restart=no`: a visible
+  failure beats a restart loop with guests on a half-configured AP.
+- **Management stays on the tether.** Guests cannot reach the Pi's admin
+  ports at all; manage the board over `usb0` or the LAN as before.
+- Deliberately not in the config UI: the AP is host-level (it needs `iw`,
+  `hostapd` and `dnsmasq` on the host, not in a container) and the passphrase
+  must not flow through the rendered `.env`.
+- Not yet verified on hardware: that Pi-hole answers a DNAT'ed guest query
+  that arrived on the AP interface but is addressed to its tether address. If
+  it does not, guests get *no* DNS (the DNAT target is the only resolver in
+  their input chain) — the failure is closed, but it is the first thing to
+  check on the board.
+
 ## Diagnostics
 
 There is no bundled support script. The useful checks are:
@@ -679,12 +755,15 @@ docker-compose.yml         # Tor + Pi-hole + config-UI stack
 pihole/etc-pihole/.gitkeep # bind mount placeholder (data ignored)
 tor/                       # Dockerfile + torrc + data dir placeholder
 ui/                        # config UI service: schema -> render -> apply
-bin/pi-tor-rules.sh        # iptables helper (apply|flush|show-rules),
-                           # executed by the ui container, sudo for manual runs
+bin/pi-tor-rules.sh        # iptables helper (apply|flush|apply-ap|flush-ap|
+                           # show-rules), executed by the ui container, sudo
+                           # for manual runs
+bin/pi-tor-ap              # Wi-Fi AP (guest) mode: hostapd + DHCP + AP rules
 bin/uplink-check.sh        # tor-side uplink gate (IPv4 lease + default route)
 bin/usb_route[, _undo]     # host-side tether toggle + saved-state undo
 hostui/                    # host tether UI: app.py + pi-tor-hostui.service
-systemd/                   # optional stack unit + env example
+systemd/                   # optional stack + AP units, env examples
+                           # (pi-tor-ap.env.example ships PI_TOR_AP_PSK empty)
 bin/gadget-watchdog.sh     # Pi-side g_ether RX-stall watchdog (reloads only
                            # on a confirmed stall, capped 3/hour)
 bin/usb-gadget-up          # configfs ECM gadget up/down/rebind/status
