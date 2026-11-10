@@ -57,6 +57,7 @@ IP_STUB = """#!/bin/sh
 printf 'ip %s\\n' "$*" >> "$AP_CALLS"
 case "$*" in
   "-o -4 addr show")
+    [ "${AP_TEST_IP_ADDR_FAIL:-}" = 1 ] && exit 1
     printf '2: wlan0    inet 192.168.0.188/24 brd 192.168.0.255 scope global wlan0\\n'
     if [ "${AP_TEST_ADDR_CONFLICT:-}" = 1 ]; then
       printf '9: lan0     inet 10.12.195.7/24 brd 10.12.195.255 scope global lan0\\n'
@@ -423,6 +424,36 @@ class ApUpTest(unittest.TestCase):
         self.assertNotEqual(res.returncode, 0)
         self.assertIn("must not overlap the tether subnet", res.stderr)
         self.assertEqual(self.fx.calls(), [])
+
+    def test_up_refuses_a_tether_net_that_contains_the_guest_subnet(self):
+        # 10.12.195.0/24 sits inside a /21 tether and shares no address string
+        # with it: only a network comparison sees that. A tether CIDR nothing
+        # can parse has to refuse too, not read as "no overlap".
+        cases = (
+            ({"PI_TOR_SUBNET": "10.12.192.0/21"}, "must not overlap the tether subnet"),
+            ({"PI_TOR_SUBNET": "10.12.195.0/24"}, "must not overlap the tether subnet"),
+            ({"PI_TOR_SUBNET": "10.12.195.0"}, "is not an IPv4 CIDR"),
+            ({"PI_TOR_SUBNET": "10.12.195.0/33"}, "is not an IPv4 CIDR"),
+        )
+        for over, msg in cases:
+            res = self.fx.run("up", **over)
+            self.assertNotEqual(res.returncode, 0, over)
+            self.assertIn(msg, res.stderr, over)
+        self.assertEqual(self.fx.calls(), [], "nothing may be created for an overlapping tether")
+        self.assertFalse(self.fx.rundir.exists())
+        self.assertIsNone(self.fx.chain("nat", "PI_TOR_AP_REDIRECT"))
+
+    def test_up_refuses_when_the_host_addresses_cannot_be_read(self):
+        # a failed `ip addr` used to read as "no addresses on this host", which
+        # passed the conflict check silently; it has to stop before any change
+        res = self.fx.run("up", AP_TEST_IP_ADDR_FAIL="1")
+        self.assertNotEqual(res.returncode, 0)
+        self.assertIn("cannot read this host's IPv4 addresses", res.stderr)
+        self.assertEqual(self.fx.calls(), ["ip -o -4 addr show"],
+                         "nothing may change after an unreadable address list")
+        self.assertFalse((self.fx.net / "uap0").exists())
+        self.assertIsNone(self.fx.chain("nat", "PI_TOR_AP_REDIRECT"))
+        self.assertFalse(self.fx.rundir.exists())
 
     def test_up_refuses_when_pihole_or_tor_is_not_listening(self):
         for over, msg in (({"AP_TEST_NO_TRANS": "1"}, "no egress"),

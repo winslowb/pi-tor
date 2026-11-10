@@ -167,6 +167,16 @@ cidr_overlap() { # <cidr> <cidr>
     END { exit !(ok == 2 && start[1] <= end[2] && start[2] <= end[1]) }'
 }
 
+# a.b.c.d/n with n <= 32 and octets <= 255: the shape cidr_overlap's
+# arithmetic assumes. A CIDR that cannot be parsed proves nothing, so a caller
+# must treat "not ok" as a refusal rather than as "no overlap".
+cidr_ok() { # <cidr>
+  printf '%s\n' "$1" | awk -F '[/.]' '
+    NF != 5 { exit 1 }
+    { for (i = 1; i <= 5; i++) if ($i !~ /^[0-9]+$/) exit 1 }
+    { exit !($5 <= 32 && $1 <= 255 && $2 <= 255 && $3 <= 255 && $4 <= 255) }'
+}
+
 # `down` runs `rm -rf` here, so in production it may only be the directory this
 # script owns; a fake-root fixture (the test suite) may point it elsewhere.
 rundir_ok() {
@@ -218,6 +228,8 @@ validate() {
     24) ;;
     *) die "PI_TOR_AP_SUBNET must be a /24 (got /$PREFIX): the DHCP range arithmetic here assumes one" ;;
   esac
+  cidr_ok "$AP_SUBNET" ||
+    die "PI_TOR_AP_SUBNET ($AP_SUBNET) is not an IPv4 CIDR (a.b.c.d/n): the overlap check cannot read it"
   # Every configured address has to be a usable host on the gateway's /24, and
   # the pool has to be a real range that cannot lease the gateway itself.
   host_in_net "$AP_GW" PI_TOR_AP_GATEWAY
@@ -233,9 +245,13 @@ validate() {
     die "PI_TOR_AP_GATEWAY ($AP_GW) is inside the DHCP pool ($DHCP_START-$DHCP_END): dnsmasq would lease the gateway address to a guest"
   fi
   TETHER_SUBNET=${PI_TOR_SUBNET:-10.12.194.0/24}
-  TETHER_NET=${TETHER_SUBNET%/*}
-  TETHER_NET=${TETHER_NET%.*}
-  if [ "$NET" = "$TETHER_NET" ] || [ "$AP_GW" = "${PI_TOR_GATEWAY:-10.12.194.1}" ]; then
+  # A wider tether (10.12.192.0/21) contains the guest /24 without any address
+  # string matching it, so this compares networks. A tether CIDR that cannot be
+  # parsed proves nothing and is refused rather than read as "no overlap".
+  cidr_ok "$TETHER_SUBNET" ||
+    die "PI_TOR_SUBNET ($TETHER_SUBNET) is not an IPv4 CIDR (a.b.c.d/n): the guest subnet cannot be proven disjoint from the tether, so the AP is not coming up"
+  if cidr_overlap "$AP_SUBNET" "$TETHER_SUBNET" ||
+    [ "$AP_GW" = "${PI_TOR_GATEWAY:-10.12.194.1}" ]; then
     die "PI_TOR_AP_SUBNET/PI_TOR_AP_GATEWAY must not overlap the tether subnet ($TETHER_SUBNET): the guest DHCP pool would hand out tether addresses"
   fi
   if [ "$AP_IF" = "$UPLINK" ]; then
@@ -254,7 +270,9 @@ preflight() {
   # their traffic is neither DNAT'ed nor dropped ahead of the LAN's own path.
   command -v awk >/dev/null 2>&1 ||
     die "awk is missing: the AP subnet cannot be checked against this host's addresses"
-  addrs=$("$IP" -o -4 addr show 2>/dev/null || true)
+  if ! addrs=$("$IP" -o -4 addr show 2>/dev/null); then
+    die "cannot read this host's IPv4 addresses ('$IP -o -4 addr show' failed): the AP subnet cannot be proven absent from this host, so the AP is not coming up"
+  fi
   for cidr in $(printf '%s\n' "$addrs" |
     awk '{ for (i = 1; i < NF; i++) if ($i == "inet") { print $(i + 1); break } }'); do
     if cidr_overlap "$NET.0/$PREFIX" "$cidr"; then
