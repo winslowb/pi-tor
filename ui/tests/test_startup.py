@@ -28,6 +28,7 @@ STUB = textwrap.dedent("""\
         exit 0
       fi
     done
+    [[ -n "${PI_TOR_FAKE_LOG:-}" ]] && printf 'iptables %s\\n' "$*" >> "$PI_TOR_FAKE_LOG"
     table="filter"
     if [[ "$1" == "-t" ]]; then table="$2"; shift 2; fi
     op="$1"; chain="$2"; shift 2
@@ -36,6 +37,15 @@ STUB = textwrap.dedent("""\
     rule="${*}"
     case "$op" in
       -A) printf '%s\\n' "$rule" >> "$file" ;;
+      -I) [[ -e "$file" ]] || : > "$file"   # builtin chains always exist
+          pos="$1"; shift
+          rule="${*}"
+          if [[ "$pos" == "1" ]]; then
+            { printf '%s\\n' "$rule"; cat "$file"; } > "$file.tmp$$"
+            mv "$file.tmp$$" "$file"
+          else
+            printf '%s\\n' "$rule" >> "$file"
+          fi ;;
       -C) [[ -e "$file" ]] && grep -qxF -- "$rule" "$file" || exit 1 ;;
       -D) [[ -e "$file" ]] || exit 1
           d=0; tmp="$file.tmp$$"; : > "$tmp"

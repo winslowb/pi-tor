@@ -1,0 +1,27 @@
+[Unit]
+Description=pi-tor Wi-Fi AP (guest) mode on the uplink's radio
+Documentation=https://github.com/winslowb/pi-tor#wi-fi-ap-guest-mode
+# The guest path DNATs DNS to Pi-hole and TCP to tor's TransPort, so an AP
+# without that stack is a network with no egress: order after it. Wants, not
+# Requires -- a broken AP must not hold the gateway back (same reasoning as
+# pi-tor-stack's Wants=pi-tor-gadget.service).
+After=pi-tor-stack.service
+Wants=pi-tor-stack.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+EnvironmentFile=-/etc/default/pi-tor
+# The AP's own values, including PI_TOR_AP_PSK: keep this file mode 0600.
+EnvironmentFile=-/etc/default/pi-tor-ap
+# literal absolute paths: systemd cannot expand a variable into one
+ExecStart=/opt/pi-tor/bin/pi-tor-ap up
+ExecStop=/opt/pi-tor/bin/pi-tor-ap down
+TimeoutStartSec=60
+TimeoutStopSec=60
+# A failed start tears itself down and stays failed: a visible failure beats a
+# restart loop that keeps guests associating with a half-configured AP.
+Restart=no
+
+[Install]
+WantedBy=multi-user.target

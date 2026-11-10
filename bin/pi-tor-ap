@@ -1,0 +1,525 @@
+#!/bin/sh
+# pi-tor Wi-Fi AP (guest) mode: an authenticated AP on the same radio as the
+# uplink, with DHCP, Pi-hole DNS and tor-only egress — and nothing else.
+#
+# One radio. On the deployed board (`iw phy`) one AP plus one managed station
+# is allowed only with #channels <= 1, so the AP can only sit on the channel
+# the uplink already uses. The channel is read from the live uplink at start;
+# if it cannot be read the script refuses rather than guessing, because a
+# wrong channel silently drops tor's only way out.
+#
+# Enforcement is not here: this script runs `bin/pi-tor-rules.sh apply-ap`,
+# whose guest input chain ends in DROP (Pi-hole DNS, DHCP, TCP to tor's
+# TransPort, everything else dropped) and which adds ip6tables DROPs for the
+# interface. hostapd's ap_isolate=1 keeps guests off each other.
+#
+# Subcommands:
+#   up      (default) render configs, apply the AP rules, create the
+#           interface, start hostapd + dnsmasq; any failure tears it all back
+#           down and exits nonzero (no half-live AP)
+#   down    stop both daemons, delete the interface, flush the AP rules
+#   status  report interface/channel/daemon state; exit 0 when hostapd runs
+#   plan    print the resolved plan; writes and starts nothing
+#
+# The Wi-Fi secret is PI_TOR_AP_PSK from /etc/default/pi-tor-ap (mode 0600).
+# There is no open mode and no default secret: an empty or too-short PSK is
+# refused before anything is created. `up` and `plan` read that file
+# themselves (PI_TOR_AP_ENVFILE overrides the path), so a manual run needs no
+# secret on the command line, where `ps` would show it to every user.
+#
+# Test seams: PI_TOR_AP_RUNDIR, PI_TOR_NET_DIR, PI_TOR_AP_SYSCTL_DIR,
+# PI_TOR_IW, PI_TOR_IP, PI_TOR_HOSTAPD, PI_TOR_DNSMASQ, PI_TOR_RULES,
+# PI_TOR_AP_WAIT, PI_TOR_FAKE_ROOT, PI_TOR_AP_ENVFILE, PI_TOR_SS (plus the
+# env pi-tor-rules.sh reads).
+set -u
+
+log() { printf '[pi-tor-ap] %s\n' "$*"; }
+die() { printf '[pi-tor-ap] %s\n' "$*" >&2; exit 1; }
+
+# The keys a file may set: exactly what this script consumes, nothing else. An
+# internal control variable or a test seam (PI_TOR_FAKE_ROOT, PI_TOR_RULES,
+# PI_TOR_AP_RUNDIR, PI_TOR_IW, ...) must not be loadable from a file on disk.
+env_key_ok() { # <name>
+  case $1 in
+    PI_TOR_AP_INTERFACE | PI_TOR_AP_SUBNET | PI_TOR_AP_GATEWAY | \
+    PI_TOR_AP_SSID | PI_TOR_AP_PSK | PI_TOR_AP_DHCP_START | \
+    PI_TOR_AP_DHCP_END | PI_TOR_AP_WAIT | PI_TOR_UPLINK | \
+    PI_TOR_INTERFACE | PI_TOR_SUBNET | PI_TOR_GATEWAY | \
+    PI_TOR_TRANS_PORT | PI_TOR_PIHOLE_PORT) return 0 ;;
+  esac
+  return 1
+}
+
+# Read KEY=VALUE lines without running anything. systemd loads
+# /etc/default/pi-tor-ap for the unit, but a manual `sudo bin/pi-tor-ap up`
+# would otherwise start with an empty SSID/PSK -- and the only way left to
+# supply them would be an argv every user on the box can read in `ps`. Only
+# allowlisted keys are honoured and an already-set variable wins, so the
+# unit's EnvironmentFile keeps precedence and the file cannot set anything
+# else. `printenv` rather than an eval'd indirect expansion: a key name from
+# the file never reaches the shell's parser.
+load_env_file() { # <path>
+  [ -r "${1:-}" ] || return 0
+  cr=$(printf '\r')
+  while IFS= read -r line || [ -n "$line" ]; do
+    line=${line%"$cr"}
+    line=${line#"${line%%[![:space:]]*}"}
+    case $line in '' | '#'* | ';'*) continue ;; esac
+    case $line in *=*) ;; *) log "ignoring malformed line in $1: no '='" ; continue ;; esac
+    key=${line%%=*}
+    val=${line#*=}
+    if ! env_key_ok "$key"; then
+      case $key in PI_TOR_*) log "ignoring unsupported key in $1: $key" ;; esac
+      continue
+    fi
+    case $val in
+      \"*\") val=${val#\"}; val=${val%\"} ;;
+      \'*\') val=${val#\'}; val=${val%\'} ;;
+      *) val=${val%"${val##*[![:space:]]}"} ;;   # systemd strips unquoted trailing space
+    esac
+    printenv "$key" >/dev/null 2>&1 && continue   # the unit's env wins
+    export "$key=$val"
+  done < "$1"
+}
+
+load_env_file "${PI_TOR_AP_ENVFILE:-/etc/default/pi-tor-ap}"
+
+AP_IF=${PI_TOR_AP_INTERFACE:-uap0}
+AP_SUBNET=${PI_TOR_AP_SUBNET:-10.12.195.0/24}
+AP_GW=${PI_TOR_AP_GATEWAY:-10.12.195.1}
+SSID=${PI_TOR_AP_SSID:-}
+PSK=${PI_TOR_AP_PSK:-}
+UPLINK=${PI_TOR_UPLINK:-wlan0}
+DEFAULT_RUNDIR=/run/pi-tor-ap
+RUNDIR=${PI_TOR_AP_RUNDIR:-$DEFAULT_RUNDIR}
+NET_DIR=${PI_TOR_NET_DIR:-/sys/class/net}
+SYSCTL_DIR=${PI_TOR_AP_SYSCTL_DIR:-/proc/sys/net/ipv6/conf}
+IW=${PI_TOR_IW:-iw}
+IP=${PI_TOR_IP:-ip}
+HOSTAPD=${PI_TOR_HOSTAPD:-hostapd}
+DNSMASQ=${PI_TOR_DNSMASQ:-dnsmasq}
+RULES=${PI_TOR_RULES:-$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)/pi-tor-rules.sh}
+WAIT=${PI_TOR_AP_WAIT:-10}
+SS=${PI_TOR_SS:-ss}
+TRANS_PORT=${PI_TOR_TRANS_PORT:-9040}
+PIHOLE_PORT=${PI_TOR_PIHOLE_PORT:-53}
+
+PREFIX=${AP_SUBNET#*/}
+# the /24 the AP owns, taken from the subnet itself: deriving it from the
+# gateway would check a gateway outside the subnet against itself
+NET=${AP_SUBNET%/*}
+NET=${NET%.*}
+DHCP_START=${PI_TOR_AP_DHCP_START:-$NET.100}
+DHCP_END=${PI_TOR_AP_DHCP_END:-$NET.199}
+HOSTAPD_CONF=$RUNDIR/hostapd.conf
+HOSTAPD_PID=$RUNDIR/hostapd.pid
+DNSMASQ_CONF=$RUNDIR/dnsmasq.conf
+DNSMASQ_PID=$RUNDIR/dnsmasq.pid
+
+ACTION=up
+MODE=apply
+case "${1:-up}" in
+  up) ;;
+  plan | --dry-run) MODE=dry ;;
+  down | status) ACTION=$1 ;;
+  *)
+    echo "usage: ${0##*/} [up|down|status|plan]" >&2
+    exit 2
+    ;;
+esac
+
+# print the exact argv; execute only outside `plan`
+run() {
+  printf '+ %s\n' "$*"
+  [ "$MODE" = dry ] || "$@"
+}
+
+require_root() {
+  [ "$MODE" = dry ] && return 0   # `plan` is the unprivileged preview
+  [ "$(id -u)" = 0 ] || [ "${PI_TOR_FAKE_ROOT:-}" = 1 ] ||
+    die "must run as root (sudo ${0##*/} $ACTION)"
+}
+
+pid_alive() {
+  [ -f "$1" ] && kill -0 "$(cat "$1")" 2>/dev/null
+}
+
+uplink_channel() {
+  "$IW" dev "$UPLINK" info 2>/dev/null |
+    sed -n 's/^[[:space:]]*channel \([0-9][0-9]*\).*/\1/p' | sed -n '1p'
+}
+
+hw_mode() { # 2.4 GHz channels are g, 5 GHz are a
+  if [ "$1" -le 14 ]; then echo g; else echo a; fi
+}
+
+# true when two IPv4 CIDRs share any address. The AP is a /24, and a wider
+# connected route (an uplink on 10.12.0.5/16) covers it without any address
+# string matching it, so the comparison has to be on networks.
+cidr_overlap() { # <cidr> <cidr>
+  printf '%s\n%s\n' "$1" "$2" | awk -F '[/.]' '
+    NF == 5 {
+      size = 2 ^ (32 - $5)
+      start[NR] = int(($1 * 16777216 + $2 * 65536 + $3 * 256 + $4) / size) * size
+      end[NR] = start[NR] + size - 1
+      ok++
+    }
+    END { exit !(ok == 2 && start[1] <= end[2] && start[2] <= end[1]) }'
+}
+
+# a.b.c.d/n with n <= 32 and octets <= 255: the shape cidr_overlap's
+# arithmetic assumes. A CIDR that cannot be parsed proves nothing, so a caller
+# must treat "not ok" as a refusal rather than as "no overlap".
+cidr_ok() { # <cidr>
+  printf '%s\n' "$1" | awk -F '[/.]' '
+    NF != 5 { exit 1 }
+    { for (i = 1; i <= 5; i++) if ($i !~ /^[0-9]+$/) exit 1 }
+    { exit !($5 <= 32 && $1 <= 255 && $2 <= 255 && $3 <= 255 && $4 <= 255) }'
+}
+
+# `down` runs `rm -rf` here, so in production it may only be the directory this
+# script owns; a fake-root fixture (the test suite) may point it elsewhere.
+rundir_ok() {
+  [ "${PI_TOR_FAKE_ROOT:-}" = 1 ] && return 0
+  [ "$RUNDIR" = "$DEFAULT_RUNDIR" ] ||
+    die "PI_TOR_AP_RUNDIR ($RUNDIR) must be $DEFAULT_RUNDIR: 'down' deletes it, so no other path is safe"
+}
+
+host_in_net() { # <address> <setting>: a usable host in $NET/24; sets LAST
+  case $1 in
+    '' | *[!0-9.]*) die "$2 ($1) is not an IPv4 address" ;;
+  esac
+  if [ "${1%.*}" != "$NET" ]; then
+    die "$2 ($1) is not inside PI_TOR_AP_SUBNET ($AP_SUBNET)"
+  fi
+  LAST=${1##*.}
+  case $LAST in
+    '' | *[!0-9]*) die "$2 ($1) is not an IPv4 address" ;;
+  esac
+  if [ "$LAST" -lt 1 ] || [ "$LAST" -gt 254 ]; then
+    die "$2 ($1) is not a usable host address in $AP_SUBNET (.0 is the network, .255 the broadcast)"
+  fi
+}
+
+validate() {
+  if [ -z "$SSID" ]; then
+    die "PI_TOR_AP_SSID is empty: the AP needs a network name"
+  fi
+  case "$SSID" in
+    *'
+'*) die "PI_TOR_AP_SSID must not contain a newline" ;;
+  esac
+  if [ ${#SSID} -gt 32 ]; then
+    die "PI_TOR_AP_SSID must be at most 32 characters"
+  fi
+  # WPA2-PSK only. An open AP (or a WEP/enterprise one) is not a mode this
+  # script can produce, and no default secret exists to fall back on.
+  if [ -z "$PSK" ]; then
+    die "PI_TOR_AP_PSK is empty: set it in /etc/default/pi-tor-ap (mode 0600); there is no open-AP mode"
+  fi
+  if [ ${#PSK} -lt 8 ] || [ ${#PSK} -gt 63 ]; then
+    die "PI_TOR_AP_PSK must be 8-63 characters (a WPA2-PSK passphrase)"
+  fi
+  case "$PSK" in
+    *'
+'*) die "PI_TOR_AP_PSK must not contain a newline" ;;
+  esac
+  case "$PREFIX" in
+    24) ;;
+    *) die "PI_TOR_AP_SUBNET must be a /24 (got /$PREFIX): the DHCP range arithmetic here assumes one" ;;
+  esac
+  cidr_ok "$AP_SUBNET" ||
+    die "PI_TOR_AP_SUBNET ($AP_SUBNET) is not an IPv4 CIDR (a.b.c.d/n): the overlap check cannot read it"
+  # Every configured address has to be a usable host on the gateway's /24, and
+  # the pool has to be a real range that cannot lease the gateway itself.
+  host_in_net "$AP_GW" PI_TOR_AP_GATEWAY
+  GW_HOST=$LAST
+  host_in_net "$DHCP_START" PI_TOR_AP_DHCP_START
+  START_HOST=$LAST
+  host_in_net "$DHCP_END" PI_TOR_AP_DHCP_END
+  END_HOST=$LAST
+  if [ "$START_HOST" -gt "$END_HOST" ]; then
+    die "PI_TOR_AP_DHCP_START ($DHCP_START) is above PI_TOR_AP_DHCP_END ($DHCP_END)"
+  fi
+  if [ "$GW_HOST" -ge "$START_HOST" ] && [ "$GW_HOST" -le "$END_HOST" ]; then
+    die "PI_TOR_AP_GATEWAY ($AP_GW) is inside the DHCP pool ($DHCP_START-$DHCP_END): dnsmasq would lease the gateway address to a guest"
+  fi
+  TETHER_SUBNET=${PI_TOR_SUBNET:-10.12.194.0/24}
+  # A wider tether (10.12.192.0/21) contains the guest /24 without any address
+  # string matching it, so this compares networks. A tether CIDR that cannot be
+  # parsed proves nothing and is refused rather than read as "no overlap".
+  cidr_ok "$TETHER_SUBNET" ||
+    die "PI_TOR_SUBNET ($TETHER_SUBNET) is not an IPv4 CIDR (a.b.c.d/n): the guest subnet cannot be proven disjoint from the tether, so the AP is not coming up"
+  if cidr_overlap "$AP_SUBNET" "$TETHER_SUBNET" ||
+    [ "$AP_GW" = "${PI_TOR_GATEWAY:-10.12.194.1}" ]; then
+    die "PI_TOR_AP_SUBNET/PI_TOR_AP_GATEWAY must not overlap the tether subnet ($TETHER_SUBNET): the guest DHCP pool would hand out tether addresses"
+  fi
+  if [ "$AP_IF" = "$UPLINK" ]; then
+    die "PI_TOR_AP_INTERFACE must differ from PI_TOR_UPLINK ($UPLINK): the uplink has to stay a managed station"
+  fi
+  if [ "$AP_IF" = "${PI_TOR_INTERFACE:-usb0}" ]; then
+    die "PI_TOR_AP_INTERFACE must differ from PI_TOR_INTERFACE (${PI_TOR_INTERFACE:-usb0}): the tether rules own that interface"
+  fi
+  rundir_ok
+}
+
+preflight() {
+  validate
+  [ -e "$NET_DIR/$UPLINK" ] || die "uplink $UPLINK does not exist under $NET_DIR"
+  # A /24 the board already answers on would put guests on a LAN subnet, where
+  # their traffic is neither DNAT'ed nor dropped ahead of the LAN's own path.
+  command -v awk >/dev/null 2>&1 ||
+    die "awk is missing: the AP subnet cannot be checked against this host's addresses"
+  if ! addrs=$("$IP" -o -4 addr show 2>/dev/null); then
+    die "cannot read this host's IPv4 addresses ('$IP -o -4 addr show' failed): the AP subnet cannot be proven absent from this host, so the AP is not coming up"
+  fi
+  for cidr in $(printf '%s\n' "$addrs" |
+    awk '{ for (i = 1; i < NF; i++) if ($i == "inet") { print $(i + 1); break } }'); do
+    if cidr_overlap "$NET.0/$PREFIX" "$cidr"; then
+      die "PI_TOR_AP_SUBNET ($AP_SUBNET) is already configured on this host ($cidr): pick a /24 this board is not on"
+    fi
+  done
+  CHANNEL=$(uplink_channel)
+  [ -n "$CHANNEL" ] || die "cannot read $UPLINK's channel from 'iw dev $UPLINK info': one radio means the AP has to share the uplink's channel, and there is no safe default"
+  HWMODE=$(hw_mode "$CHANNEL")
+  log "uplink $UPLINK is on channel $CHANNEL: the AP shares it (hw_mode=$HWMODE)"
+}
+
+write_confs() {
+  if [ "$MODE" = dry ]; then
+    printf '+ write %s (mode 0600, WPA2-PSK, channel %s)\n' "$HOSTAPD_CONF" "$CHANNEL"
+    printf '+ write %s (DHCP %s-%s, DNS %s)\n' "$DNSMASQ_CONF" "$DHCP_START" "$DHCP_END" "$AP_GW"
+    return 0
+  fi
+  umask 077
+  mkdir -p "$RUNDIR" || die "cannot create $RUNDIR"
+  chmod 700 "$RUNDIR" || die "cannot restrict $RUNDIR"
+  {
+    echo "interface=$AP_IF"
+    echo "driver=nl80211"
+    echo "ssid=$SSID"
+    echo "hw_mode=$HWMODE"
+    echo "channel=$CHANNEL"
+    echo "auth_algs=1"
+    echo "wpa=2"
+    echo "wpa_key_mgmt=WPA-PSK"
+    echo "wpa_passphrase=$PSK"
+    echo "rsn_pairwise=CCMP"
+    echo "ap_isolate=1"
+  } > "$HOSTAPD_CONF" || die "cannot write $HOSTAPD_CONF"
+  chmod 600 "$HOSTAPD_CONF" || die "cannot restrict $HOSTAPD_CONF"
+  {
+    echo "# DHCP only: port=0 leaves DNS to the Pi-hole DNAT rule in"
+    echo "# bin/pi-tor-rules.sh apply-ap. interface= plus bind-dynamic confine"
+    echo "# both listeners to the guest interface, so nothing is served on the"
+    echo "# uplink or the tether."
+    echo "port=0"
+    echo "bind-dynamic"
+    echo "interface=$AP_IF"
+    echo "no-hosts"
+    echo "no-resolv"
+    echo "dhcp-authoritative"
+    echo "dhcp-leasefile=$RUNDIR/dnsmasq.leases"
+    echo "dhcp-range=$DHCP_START,$DHCP_END,255.255.255.0,1h"
+    echo "dhcp-option=3,$AP_GW"
+    echo "dhcp-option=6,$AP_GW"
+  } > "$DNSMASQ_CONF" || die "cannot write $DNSMASQ_CONF"
+  chmod 600 "$DNSMASQ_CONF" || die "cannot restrict $DNSMASQ_CONF"
+}
+
+rules() { # apply-ap: fatal, because an unfiltered AP is the leak we are here to prevent
+  [ -f "$RULES" ] || die "$RULES not found: set PI_TOR_RULES or run from the checkout"
+  if [ "$MODE" = dry ]; then
+    printf '+ PI_TOR_AP_INTERFACE=%s PI_TOR_AP_SUBNET=%s PI_TOR_AP_GATEWAY=%s %s apply-ap\n' \
+      "$AP_IF" "$AP_SUBNET" "$AP_GW" "$RULES"
+    return 0
+  fi
+  PI_TOR_AP_INTERFACE=$AP_IF PI_TOR_AP_SUBNET=$AP_SUBNET PI_TOR_AP_GATEWAY=$AP_GW \
+    "$RULES" apply-ap ||
+    die "bin/pi-tor-rules.sh apply-ap failed: guests would not be confined, so the AP is not coming up"
+}
+
+iface_up() {
+  if [ -e "$NET_DIR/$AP_IF" ]; then
+    log "$AP_IF already exists; reusing it"
+  else
+    run "$IW" dev "$UPLINK" interface add "$AP_IF" type __ap
+    i=0
+    while [ "$MODE" != dry ] && [ ! -e "$NET_DIR/$AP_IF" ] && [ "$i" -lt "$WAIT" ]; do
+      sleep 1
+      i=$((i + 1))
+    done
+    if [ "$MODE" != dry ] && [ ! -e "$NET_DIR/$AP_IF" ]; then
+      die "$AP_IF did not appear within ${WAIT}s: the radio may not allow AP+station (need #channels <= 1)"
+    fi
+  fi
+  run "$IP" link set "$AP_IF" up
+  addrs=$("$IP" -o -4 addr show dev "$AP_IF" 2>/dev/null || true)
+  case "$addrs" in
+    *" $AP_GW/"*) : ;;
+    *) run "$IP" addr add "$AP_GW/$PREFIX" dev "$AP_IF" ;;
+  esac
+  ipv6_off
+}
+
+ipv6_off() {
+  f=$SYSCTL_DIR/$AP_IF/disable_ipv6
+  if [ ! -e "$f" ]; then
+    log "no $f: IPv6 is already absent on $AP_IF"
+    return 0
+  fi
+  printf '+ printf 1 > %s\n' "$f"
+  if [ "$MODE" != dry ]; then
+    printf 1 > "$f" || die "cannot disable IPv6 on $AP_IF ($f)"
+  fi
+}
+
+start_hostapd() {
+  printf '+ %s -B -P %s %s\n' "$HOSTAPD" "$HOSTAPD_PID" "$HOSTAPD_CONF"
+  [ "$MODE" = dry ] && return 0
+  "$HOSTAPD" -B -P "$HOSTAPD_PID" "$HOSTAPD_CONF" ||
+    die "$HOSTAPD refused to start (the channel being unusable for AP+station is the usual cause)"
+  pid_alive "$HOSTAPD_PID" || die "$HOSTAPD exited right after start"
+}
+
+start_dnsmasq() {
+  printf '+ %s --conf-file=%s --pid-file=%s\n' "$DNSMASQ" "$DNSMASQ_CONF" "$DNSMASQ_PID"
+  [ "$MODE" = dry ] && return 0
+  "$DNSMASQ" --conf-file="$DNSMASQ_CONF" --pid-file="$DNSMASQ_PID" ||
+    die "$DNSMASQ refused to start"
+  pid_alive "$DNSMASQ_PID" || die "$DNSMASQ exited right after start"
+}
+
+verify() {
+  link=$("$IW" dev "$UPLINK" link 2>/dev/null || true)
+  case "$link" in
+    '' | *"Not connected"* | *"Not associated"*)
+      die "uplink $UPLINK lost its association when the AP started: one radio, and AP+station must share the channel" ;;
+  esac
+  apinfo=$("$IW" dev "$AP_IF" info 2>/dev/null || true)
+  case "$apinfo" in
+    *"type AP"*) : ;;
+    *) die "$AP_IF is not in AP mode after start" ;;
+  esac
+}
+
+# Guests have no resolver and no direct egress of their own: every path out is
+# either Pi-hole's DNS or tor's TransPort. With nothing listening the AP would
+# hand out leases that lead nowhere, so refuse instead of serving.
+listeners_ok() {
+  command -v "$SS" >/dev/null 2>&1 ||
+    { log "no '$SS': cannot pre-check the Pi-hole (:$PIHOLE_PORT) and tor (:$TRANS_PORT) listeners" ; return 0 ; }
+  tcp=$("$SS" -Hltn 2>/dev/null || true)
+  case $tcp in
+    *":$TRANS_PORT "*) : ;;
+    *) die "nothing listens on tcp/$TRANS_PORT (tor's TransPort): guests would have no egress, so the AP is not coming up" ;;
+  esac
+  udp=$("$SS" -Hlun 2>/dev/null || true)
+  case $udp in
+    *":$PIHOLE_PORT "*) : ;;
+    *) die "nothing listens on udp/$PIHOLE_PORT (Pi-hole DNS): guests would have no resolver, so the AP is not coming up" ;;
+  esac
+}
+
+stop_pid() { # <pidfile> <name>
+  [ -f "$1" ] || return 0
+  pid=$(cat "$1" 2>/dev/null || true)
+  rm -f "$1"
+  case "$pid" in
+    '' | *[!0-9]*) return 0 ;;
+  esac
+  kill -0 "$pid" 2>/dev/null || return 0
+  log "stopping $2 (pid $pid)"
+  kill "$pid" 2>/dev/null || true
+  i=0
+  while kill -0 "$pid" 2>/dev/null && [ "$i" -lt "$WAIT" ]; do
+    sleep 1
+    i=$((i + 1))
+  done
+  kill -0 "$pid" 2>/dev/null && kill -9 "$pid" 2>/dev/null
+  return 0
+}
+
+stop_daemons() {
+  stop_pid "$DNSMASQ_PID" dnsmasq
+  stop_pid "$HOSTAPD_PID" hostapd
+}
+
+STARTED=0
+cleanup_failed_start() {
+  [ "$STARTED" = 1 ] && return 0
+  [ "$MODE" = dry ] && return 0
+  log "start failed: rolling the AP back down"
+  # Subshelved with the EXIT trap cleared: down() calls die() when it cannot
+  # finish, and that exit would kill this trap before it could report anything.
+  if ! ( trap - EXIT; down ); then
+    log "WARNING: rollback incomplete; check '${0##*/} status' and 'bin/pi-tor-rules.sh show-rules'"
+  fi
+}
+
+up() {
+  preflight
+  require_root
+  listeners_ok
+  trap cleanup_failed_start EXIT
+  stop_daemons # a re-run picks up config changes
+  write_confs
+  # Rules first: there must be no moment where a guest can associate and get
+  # an unfiltered packet out. The interface-specific rules are inert until
+  # the interface exists.
+  rules
+  iface_up
+  start_hostapd
+  start_dnsmasq
+  verify
+  STARTED=1
+  trap - EXIT
+  log "AP up: ssid=$SSID if=$AP_IF addr=$AP_GW/$PREFIX channel=$CHANNEL dhcp=$DHCP_START-$DHCP_END (DNS via Pi-hole, egress via tor)"
+}
+
+down() {
+  rundir_ok   # before anything is removed: the path is the destructive part
+  require_root
+  stop_daemons
+  if [ -e "$NET_DIR/$AP_IF" ]; then
+    run "$IP" link del "$AP_IF"
+  fi
+  if [ -f "$RULES" ]; then
+    if [ "$MODE" = dry ]; then
+      printf '+ PI_TOR_AP_INTERFACE=%s PI_TOR_AP_SUBNET=%s %s flush-ap\n' \
+        "$AP_IF" "$AP_SUBNET" "$RULES"
+    else
+      PI_TOR_AP_INTERFACE=$AP_IF PI_TOR_AP_SUBNET=$AP_SUBNET \
+        "$RULES" flush-ap ||
+        log "WARNING: AP firewall rules not fully flushed"
+    fi
+  fi
+  [ "$MODE" = dry ] || rm -rf "$RUNDIR"
+  [ -e "$NET_DIR/$AP_IF" ] && die "teardown incomplete: $AP_IF still exists"
+  [ -e "$HOSTAPD_CONF" ] && die "teardown incomplete: $HOSTAPD_CONF still exists"
+  log "AP down"
+  return 0
+}
+
+status() {
+  ch=$(uplink_channel)
+  log "ap_if=$AP_IF uplink=$UPLINK channel=${ch:-unknown} subnet=$AP_SUBNET gateway=$AP_GW"
+  if [ -e "$NET_DIR/$AP_IF" ]; then log "$AP_IF present"; else log "$AP_IF absent"; fi
+  if pid_alive "$HOSTAPD_PID"; then
+    log "hostapd running (pid $(cat "$HOSTAPD_PID"))"
+    if pid_alive "$DNSMASQ_PID"; then
+      log "dnsmasq running (pid $(cat "$DNSMASQ_PID"))"
+    else
+      log "dnsmasq not running: guests get no DHCP lease"
+    fi
+    return 0
+  fi
+  log "hostapd not running"
+  return 1
+}
+
+case "$ACTION" in
+  up) up ;;
+  down) down ;;
+  status) status ;;
+esac
