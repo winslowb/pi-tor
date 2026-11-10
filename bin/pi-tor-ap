@@ -23,12 +23,48 @@
 #
 # The Wi-Fi secret is PI_TOR_AP_PSK from /etc/default/pi-tor-ap (mode 0600).
 # There is no open mode and no default secret: an empty or too-short PSK is
-# refused before anything is created.
+# refused before anything is created. `up` and `plan` read that file
+# themselves (PI_TOR_AP_ENVFILE overrides the path), so a manual run needs no
+# secret on the command line, where `ps` would show it to every user.
 #
 # Test seams: PI_TOR_AP_RUNDIR, PI_TOR_NET_DIR, PI_TOR_AP_SYSCTL_DIR,
 # PI_TOR_IW, PI_TOR_IP, PI_TOR_HOSTAPD, PI_TOR_DNSMASQ, PI_TOR_RULES,
-# PI_TOR_AP_WAIT, PI_TOR_FAKE_ROOT (plus the env pi-tor-rules.sh reads).
+# PI_TOR_AP_WAIT, PI_TOR_FAKE_ROOT, PI_TOR_AP_ENVFILE, PI_TOR_SS (plus the
+# env pi-tor-rules.sh reads).
 set -u
+
+log() { printf '[pi-tor-ap] %s\n' "$*"; }
+die() { printf '[pi-tor-ap] %s\n' "$*" >&2; exit 1; }
+
+# Read KEY=VALUE lines without running anything. systemd loads
+# /etc/default/pi-tor-ap for the unit, but a manual `sudo bin/pi-tor-ap up`
+# would otherwise start with an empty SSID/PSK -- and the only way left to
+# supply them would be an argv every user on the box can read in `ps`. Only
+# PI_TOR_* keys are honoured and an already-set variable wins, so the unit's
+# EnvironmentFile keeps precedence and the file cannot set anything else.
+load_env_file() { # <path>
+  [ -r "${1:-}" ] || return 0
+  cr=$(printf '\r')
+  while IFS= read -r line || [ -n "$line" ]; do
+    line=${line%"$cr"}
+    line=${line#"${line%%[![:space:]]*}"}
+    case $line in '' | '#'* | ';'*) continue ;; esac
+    case $line in *=*) ;; *) log "ignoring malformed line in $1: no '='" ; continue ;; esac
+    key=${line%%=*}
+    val=${line#*=}
+    case $key in PI_TOR_*) ;; *) continue ;; esac
+    case $val in
+      \"*\") val=${val#\"}; val=${val%\"} ;;
+      \'*\') val=${val#\'}; val=${val%\'} ;;
+      *) val=${val%"${val##*[![:space:]]}"} ;;   # systemd strips unquoted trailing space
+    esac
+    eval "have=\${$key+1}"
+    [ "${have:-}" = 1 ] && continue
+    export "$key=$val"
+  done < "$1"
+}
+
+load_env_file "${PI_TOR_AP_ENVFILE:-/etc/default/pi-tor-ap}"
 
 AP_IF=${PI_TOR_AP_INTERFACE:-uap0}
 AP_SUBNET=${PI_TOR_AP_SUBNET:-10.12.195.0/24}
@@ -45,6 +81,9 @@ HOSTAPD=${PI_TOR_HOSTAPD:-hostapd}
 DNSMASQ=${PI_TOR_DNSMASQ:-dnsmasq}
 RULES=${PI_TOR_RULES:-$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)/pi-tor-rules.sh}
 WAIT=${PI_TOR_AP_WAIT:-10}
+SS=${PI_TOR_SS:-ss}
+TRANS_PORT=${PI_TOR_TRANS_PORT:-9040}
+PIHOLE_PORT=${PI_TOR_PIHOLE_PORT:-53}
 
 PREFIX=${AP_SUBNET#*/}
 NET=${AP_GW%.*}
@@ -66,9 +105,6 @@ case "${1:-up}" in
     exit 2
     ;;
 esac
-
-log() { printf '[pi-tor-ap] %s\n' "$*"; }
-die() { printf '[pi-tor-ap] %s\n' "$*" >&2; exit 1; }
 
 # print the exact argv; execute only outside `plan`
 run() {
@@ -95,6 +131,22 @@ hw_mode() { # 2.4 GHz channels are g, 5 GHz are a
   if [ "$1" -le 14 ]; then echo g; else echo a; fi
 }
 
+host_in_net() { # <address> <setting>: a usable host in $NET/24; sets LAST
+  case $1 in
+    '' | *[!0-9.]*) die "$2 ($1) is not an IPv4 address" ;;
+  esac
+  if [ "${1%.*}" != "$NET" ]; then
+    die "$2 ($1) is not inside PI_TOR_AP_SUBNET ($AP_SUBNET)"
+  fi
+  LAST=${1##*.}
+  case $LAST in
+    '' | *[!0-9]*) die "$2 ($1) is not an IPv4 address" ;;
+  esac
+  if [ "$LAST" -lt 1 ] || [ "$LAST" -gt 254 ]; then
+    die "$2 ($1) is not a usable host address in $AP_SUBNET (.0 is the network, .255 the broadcast)"
+  fi
+}
+
 validate() {
   if [ -z "$SSID" ]; then
     die "PI_TOR_AP_SSID is empty: the AP needs a network name"
@@ -118,19 +170,29 @@ validate() {
     *'
 '*) die "PI_TOR_AP_PSK must not contain a newline" ;;
   esac
-  case "$AP_GW" in
-    '' | *[!0-9.]*) die "PI_TOR_AP_GATEWAY ($AP_GW) is not an IPv4 address" ;;
-  esac
   case "$PREFIX" in
     24) ;;
     *) die "PI_TOR_AP_SUBNET must be a /24 (got /$PREFIX): the DHCP range arithmetic here assumes one" ;;
   esac
-  if [ "$NET" != "${AP_SUBNET%.*}" ]; then
-    die "PI_TOR_AP_GATEWAY ($AP_GW) is not inside PI_TOR_AP_SUBNET ($AP_SUBNET)"
+  # Every configured address has to be a usable host on the gateway's /24, and
+  # the pool has to be a real range that cannot lease the gateway itself.
+  host_in_net "$AP_GW" PI_TOR_AP_GATEWAY
+  GW_HOST=$LAST
+  host_in_net "$DHCP_START" PI_TOR_AP_DHCP_START
+  START_HOST=$LAST
+  host_in_net "$DHCP_END" PI_TOR_AP_DHCP_END
+  END_HOST=$LAST
+  if [ "$START_HOST" -gt "$END_HOST" ]; then
+    die "PI_TOR_AP_DHCP_START ($DHCP_START) is above PI_TOR_AP_DHCP_END ($DHCP_END)"
   fi
-  if [ "$AP_GW" = "${PI_TOR_GATEWAY:-10.12.194.1}" ] ||
-     [ "$AP_SUBNET" = "${PI_TOR_SUBNET:-10.12.194.0/24}" ]; then
-    die "PI_TOR_AP_SUBNET/PI_TOR_AP_GATEWAY must not overlap the tether subnet (${PI_TOR_SUBNET:-10.12.194.0/24}): the guest DHCP pool would hand out tether addresses"
+  if [ "$GW_HOST" -ge "$START_HOST" ] && [ "$GW_HOST" -le "$END_HOST" ]; then
+    die "PI_TOR_AP_GATEWAY ($AP_GW) is inside the DHCP pool ($DHCP_START-$DHCP_END): dnsmasq would lease the gateway address to a guest"
+  fi
+  TETHER_SUBNET=${PI_TOR_SUBNET:-10.12.194.0/24}
+  TETHER_NET=${TETHER_SUBNET%/*}
+  TETHER_NET=${TETHER_NET%.*}
+  if [ "$NET" = "$TETHER_NET" ] || [ "$AP_GW" = "${PI_TOR_GATEWAY:-10.12.194.1}" ]; then
+    die "PI_TOR_AP_SUBNET/PI_TOR_AP_GATEWAY must not overlap the tether subnet ($TETHER_SUBNET): the guest DHCP pool would hand out tether addresses"
   fi
   if [ "$AP_IF" = "$UPLINK" ]; then
     die "PI_TOR_AP_INTERFACE must differ from PI_TOR_UPLINK ($UPLINK): the uplink has to stay a managed station"
@@ -147,6 +209,14 @@ validate() {
 preflight() {
   validate
   [ -e "$NET_DIR/$UPLINK" ] || die "uplink $UPLINK does not exist under $NET_DIR"
+  # A /24 the board already answers on would put guests on a LAN subnet, where
+  # their traffic is neither DNAT'ed nor dropped ahead of the LAN's own path.
+  addrs=$("$IP" -o -4 addr show 2>/dev/null || true)
+  case $addrs in
+    *"inet $NET."*)
+      die "PI_TOR_AP_SUBNET ($AP_SUBNET) is already configured on this host: pick a /24 this board is not on"
+      ;;
+  esac
   CHANNEL=$(uplink_channel)
   [ -n "$CHANNEL" ] || die "cannot read $UPLINK's channel from 'iw dev $UPLINK info': one radio means the AP has to share the uplink's channel, and there is no safe default"
   HWMODE=$(hw_mode "$CHANNEL")
@@ -198,10 +268,12 @@ write_confs() {
 rules() { # apply-ap: fatal, because an unfiltered AP is the leak we are here to prevent
   [ -f "$RULES" ] || die "$RULES not found: set PI_TOR_RULES or run from the checkout"
   if [ "$MODE" = dry ]; then
-    printf '+ PI_TOR_AP_INTERFACE=%s %s apply-ap\n' "$AP_IF" "$RULES"
+    printf '+ PI_TOR_AP_INTERFACE=%s PI_TOR_AP_SUBNET=%s PI_TOR_AP_GATEWAY=%s %s apply-ap\n' \
+      "$AP_IF" "$AP_SUBNET" "$AP_GW" "$RULES"
     return 0
   fi
-  PI_TOR_AP_INTERFACE=$AP_IF "$RULES" apply-ap ||
+  PI_TOR_AP_INTERFACE=$AP_IF PI_TOR_AP_SUBNET=$AP_SUBNET PI_TOR_AP_GATEWAY=$AP_GW \
+    "$RULES" apply-ap ||
     die "bin/pi-tor-rules.sh apply-ap failed: guests would not be confined, so the AP is not coming up"
 }
 
@@ -269,6 +341,24 @@ verify() {
   esac
 }
 
+# Guests have no resolver and no direct egress of their own: every path out is
+# either Pi-hole's DNS or tor's TransPort. With nothing listening the AP would
+# hand out leases that lead nowhere, so refuse instead of serving.
+listeners_ok() {
+  command -v "$SS" >/dev/null 2>&1 ||
+    { log "no '$SS': cannot pre-check the Pi-hole (:$PIHOLE_PORT) and tor (:$TRANS_PORT) listeners" ; return 0 ; }
+  tcp=$("$SS" -Hltn 2>/dev/null || true)
+  case $tcp in
+    *":$TRANS_PORT "*) : ;;
+    *) die "nothing listens on tcp/$TRANS_PORT (tor's TransPort): guests would have no egress, so the AP is not coming up" ;;
+  esac
+  udp=$("$SS" -Hlun 2>/dev/null || true)
+  case $udp in
+    *":$PIHOLE_PORT "*) : ;;
+    *) die "nothing listens on udp/$PIHOLE_PORT (Pi-hole DNS): guests would have no resolver, so the AP is not coming up" ;;
+  esac
+}
+
 stop_pid() { # <pidfile> <name>
   [ -f "$1" ] || return 0
   pid=$(cat "$1" 2>/dev/null || true)
@@ -298,12 +388,17 @@ cleanup_failed_start() {
   [ "$STARTED" = 1 ] && return 0
   [ "$MODE" = dry ] && return 0
   log "start failed: rolling the AP back down"
-  down || log "WARNING: rollback incomplete; check '${0##*/} status' and 'bin/pi-tor-rules.sh show-rules'"
+  # Subshelved with the EXIT trap cleared: down() calls die() when it cannot
+  # finish, and that exit would kill this trap before it could report anything.
+  if ! ( trap - EXIT; down ); then
+    log "WARNING: rollback incomplete; check '${0##*/} status' and 'bin/pi-tor-rules.sh show-rules'"
+  fi
 }
 
 up() {
   preflight
   require_root
+  listeners_ok
   trap cleanup_failed_start EXIT
   stop_daemons # a re-run picks up config changes
   write_confs
@@ -328,9 +423,11 @@ down() {
   fi
   if [ -f "$RULES" ]; then
     if [ "$MODE" = dry ]; then
-      printf '+ PI_TOR_AP_INTERFACE=%s %s flush-ap\n' "$AP_IF" "$RULES"
+      printf '+ PI_TOR_AP_INTERFACE=%s PI_TOR_AP_SUBNET=%s %s flush-ap\n' \
+        "$AP_IF" "$AP_SUBNET" "$RULES"
     else
-      PI_TOR_AP_INTERFACE=$AP_IF "$RULES" flush-ap ||
+      PI_TOR_AP_INTERFACE=$AP_IF PI_TOR_AP_SUBNET=$AP_SUBNET \
+        "$RULES" flush-ap ||
         log "WARNING: AP firewall rules not fully flushed"
     fi
   fi

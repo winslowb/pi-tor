@@ -676,9 +676,27 @@ sudo bin/pi-tor-ap down                   # stops daemons, deletes the AP
 sudo systemctl enable --now pi-tor-ap.service   # optional: start on boot
 ```
 
-Host packages: `hostapd`, `dnsmasq` and `iw` (Armbian:
-`sudo apt install hostapd dnsmasq iw`; tor, Pi-hole and the tether are
-unchanged).
+`up` and `plan` read `/etc/default/pi-tor-ap` themselves (`PI_TOR_AP_ENVFILE`
+overrides the path) with a plain `KEY=VALUE` reader: nothing is executed and
+only `PI_TOR_*` keys are taken, so a manual run never needs the passphrase on
+the command line where `ps` would show it. Values already in the environment
+win, which is what the unit's `EnvironmentFile` supplies.
+
+Host packages: `hostapd`, `dnsmasq` and `iw` on Armbian. The distro units must
+not run alongside the AP — `dnsmasq.service` would take `:53` away from
+Pi-hole, and `hostapd.service` would fight for the radio — and apt starts both
+as it installs them. Mask them in the same session, before starting the AP:
+
+```bash
+sudo apt install hostapd dnsmasq iw
+sudo systemctl mask --now dnsmasq.service hostapd.service
+```
+
+Masking is required, not tidiness: an unmasked `dnsmasq.service` means a second
+resolver, an unmasked `hostapd.service` means a second daemon on a single
+radio. `pi-tor-ap` starts its own `dnsmasq` (`port=0`, so DHCP only) and its
+own `hostapd` from `/run/pi-tor-ap`, and Pi-hole's resolver stays in its
+container, so nothing is lost. tor, Pi-hole and the tether are unchanged.
 
 What guests get:
 
@@ -692,7 +710,10 @@ What guests get:
 - **DHCP from a dnsmasq bound to the AP interface only.** `port=0` means it is
   not a second resolver; `interface=` plus `bind-dynamic` means nothing is
   served on the uplink or the tether. The pool defaults to `.100-.199` of the
-  AP subnet, which must be a `/24` (the arithmetic assumes one).
+  AP subnet, which must be a `/24` (the arithmetic assumes one). The guest
+  input chain admits exactly two DHCP packets: a client with no lease yet
+  (`0.0.0.0:68 -> 255.255.255.255:67`) and a renewal from inside the guest
+  `/24` to the AP gateway on the same port pair.
 - **Pi-hole DNS, without widening Pi-hole.** Guest `udp/tcp 53` is DNAT'ed to
   `PI_TOR_GATEWAY:53`. Pi-hole keeps its `FTLCONF_dns_interface` (the tether
   interface, `SINGLE`) and its tor-only upstream: no second listener, no
@@ -701,6 +722,11 @@ What guests get:
   `PI_TOR_GATEWAY:PI_TOR_TRANS_PORT`, i.e. into tor's TransPort. DNAT rather
   than REDIRECT on purpose: a REDIRECT would land on the AP interface's own
   address, where neither Pi-hole nor TransPort is bound.
+- **Guest sources are pinned to the AP `/24`.** Every `ACCEPT` in the guest
+  input chain carries `-s` (the DHCP bootstrap is pinned to `0.0.0.0/32` and
+  its port pair instead). Without it a guest could spoof a LAN address such as
+  `192.168.0.5` and receive the replies over the LAN: an unfiltered path around
+  tor that no destination match would catch.
 - **Everything else dropped** by the guest input chain's trailing `-j DROP`:
   non-DNS UDP (QUIC, mDNS), ICMP, and any attempt to reach SSH :22, Pi-hole
   :80 or the config UI :8080 on the Pi. `FORWARD` from the guest interface is
@@ -709,6 +735,13 @@ What guests get:
   at all when `ip6tables` is missing instead of leaving an IPv6 path open.
 - **Client isolation.** `ap_isolate=1` in `hostapd.conf`, plus that forwarding
   drop.
+- **The AP hooks are inserted, not appended.** The guest jumps go in at
+  position 1 of nat `PREROUTING` and of filter `INPUT`/`FORWARD` (IPv4 and
+  IPv6), so a broad `ACCEPT` that was already there — Docker's chains, a distro
+  firewall, IPv6 `FORWARD`'s `ACCEPT` policy — can never match first. A
+  reapply is fail-closed too: a temporary guest `DROP` in `INPUT` covers the
+  moment the `PI_TOR_AP_IN` chain is flushed and refilled, and is removed only
+  after the new rules are in place.
 
 Constraints that cannot be designed around:
 
@@ -722,8 +755,17 @@ Constraints that cannot be designed around:
   interface is usable, so there is no window in which a guest can associate
   unfiltered. Any later failure (hostapd rejecting the channel, dnsmasq
   failing to start, the uplink losing its association) tears the whole AP back
-  down and exits nonzero. `pi-tor-ap.service` sets `Restart=no`: a visible
-  failure beats a restart loop with guests on a half-configured AP.
+  down and exits nonzero; if that rollback cannot finish either, it says so
+  (`WARNING: rollback incomplete` with what to check) instead of exiting
+  silently inside the failure path. `pi-tor-ap.service` sets `Restart=no`: a
+  visible failure beats a restart loop with guests on a half-configured AP.
+- **Preflight refuses what would mis-serve guests.** `up` rejects a gateway,
+  DHCP start or DHCP end that is not a usable host in the AP `/24` (`.0`,
+  `.255`), a pool that is inverted or that contains the gateway, an AP `/24`
+  the board already has an address in (so the uplink LAN and the guest network
+  cannot overlap), any overlap with the tether subnet, and — with `ss`
+  available — a host where nothing listens on Pi-hole's `:53` or tor's
+  TransPort, which would leave guests with a lease and no way out.
 - **Management stays on the tether.** Guests cannot reach the Pi's admin
   ports at all; manage the board over `usb0` or the LAN as before.
 - Deliberately not in the config UI: the AP is host-level (it needs `iw`,
@@ -733,7 +775,10 @@ Constraints that cannot be designed around:
   that arrived on the AP interface but is addressed to its tether address. If
   it does not, guests get *no* DNS (the DNAT target is the only resolver in
   their input chain) — the failure is closed, but it is the first thing to
-  check on the board.
+  check on the board. Also unverified there: the `ss` probe against the
+  containerized Pi-hole and tor listeners, and that the inserted hooks really
+  do land ahead of Docker's own `PREROUTING`/`FORWARD` rules (the tests prove
+  the ordering against a simulated ruleset, not against this board's netfilter).
 
 ## Diagnostics
 

@@ -28,6 +28,8 @@ GATEWAY_CIDR="${GATEWAY_IP}/${SUBNET_BITS}"
 AP_INTERFACE="${PI_TOR_AP_INTERFACE:-}"
 AP_CHAIN="${PI_TOR_AP_CHAIN:-PI_TOR_AP_REDIRECT}"
 AP_IN_CHAIN="${PI_TOR_AP_IN_CHAIN:-PI_TOR_AP_IN}"
+AP_SUBNET="${PI_TOR_AP_SUBNET:-10.12.195.0/24}"
+AP_GATEWAY="${PI_TOR_AP_GATEWAY:-10.12.195.1}"
 PIHOLE_PORT="${PI_TOR_PIHOLE_PORT:-53}"
 
 # Protected hosts: IPv4 addresses traffic to which must never be diverted
@@ -96,10 +98,17 @@ ap_filter_rules() {
   # QUIC and every other non-DNS UDP, ICMP, mDNS, a guest reaching the Pi's
   # admin ports, and any protocol that is neither TCP nor DNS. DHCP is udp/67
   # on this interface only (bin/pi-tor-ap's dnsmasq binds nowhere else).
-  printf '%s\n' "-i $AP_INTERFACE -p udp -d $GATEWAY_IP --dport $PIHOLE_PORT -j ACCEPT"
-  printf '%s\n' "-i $AP_INTERFACE -p tcp -d $GATEWAY_IP --dport $PIHOLE_PORT -j ACCEPT"
-  printf '%s\n' "-i $AP_INTERFACE -p udp --dport 67 -j ACCEPT"
-  printf '%s\n' "-i $AP_INTERFACE -p tcp -d $GATEWAY_IP --dport $TOR_TRANS_PORT -j ACCEPT"
+  #
+  # Every ACCEPT pins the guest subnet as source. Without -s a guest can spoof
+  # a LAN address (192.168.0.5) and have the replies delivered over the LAN --
+  # an unfiltered path around tor that no destination match would catch. DHCP
+  # is the one exception, because a client with no lease has no address yet; it
+  # is pinned to DHCP's own address pair and port pair instead.
+  printf '%s\n' "-i $AP_INTERFACE -s $AP_SUBNET -p udp -d $GATEWAY_IP --dport $PIHOLE_PORT -j ACCEPT"
+  printf '%s\n' "-i $AP_INTERFACE -s $AP_SUBNET -p tcp -d $GATEWAY_IP --dport $PIHOLE_PORT -j ACCEPT"
+  printf '%s\n' "-i $AP_INTERFACE -s 0.0.0.0/32 -p udp -d 255.255.255.255 --sport 68 --dport 67 -j ACCEPT"
+  printf '%s\n' "-i $AP_INTERFACE -s $AP_SUBNET -p udp -d $AP_GATEWAY --sport 68 --dport 67 -j ACCEPT"
+  printf '%s\n' "-i $AP_INTERFACE -s $AP_SUBNET -p tcp -d $GATEWAY_IP --dport $TOR_TRANS_PORT -j ACCEPT"
   printf '%s\n' "-i $AP_INTERFACE -j DROP"
 }
 
@@ -110,14 +119,14 @@ show_ap_rules() {
   while IFS= read -r rule; do
     printf '%s\n' "$ipt -t nat -A $AP_CHAIN $rule"
   done < <(ap_chain_rules)
-  printf '%s\n' "$ipt -t nat -A PREROUTING -i $AP_INTERFACE -j $AP_CHAIN"
+  printf '%s\n' "$ipt -t nat -I PREROUTING 1 -i $AP_INTERFACE -j $AP_CHAIN"
   while IFS= read -r rule; do
     printf '%s\n' "$ipt -t filter -A $AP_IN_CHAIN $rule"
   done < <(ap_filter_rules)
-  printf '%s\n' "$ipt -t filter -A INPUT -i $AP_INTERFACE -j $AP_IN_CHAIN"
-  printf '%s\n' "$ipt -t filter -A FORWARD -i $AP_INTERFACE -j DROP"
-  printf '%s\n' "$ip6t -t filter -A INPUT -i $AP_INTERFACE -j DROP"
-  printf '%s\n' "$ip6t -t filter -A FORWARD -i $AP_INTERFACE -j DROP"
+  printf '%s\n' "$ipt -t filter -I INPUT 1 -i $AP_INTERFACE -j $AP_IN_CHAIN"
+  printf '%s\n' "$ipt -t filter -I FORWARD 1 -i $AP_INTERFACE -j DROP"
+  printf '%s\n' "$ip6t -t filter -I INPUT 1 -i $AP_INTERFACE -j DROP"
+  printf '%s\n' "$ip6t -t filter -I FORWARD 1 -i $AP_INTERFACE -j DROP"
 }
 
 show_rules() {
@@ -203,10 +212,20 @@ delete_rule_if_present() {
   done
 }
 
-add6_rule_if_missing() {
-  local table="$1"; shift
-  if ! "$IP6TABLES_BIN" -t "$table" -C "$@" >/dev/null 2>&1; then
-    "$IP6TABLES_BIN" -t "$table" -A "$@" >/dev/null
+# Insert at position 1, never append: a broad ACCEPT already installed by
+# Docker, a distro firewall or a legacy run would otherwise match first and
+# bypass the guest chain entirely (IPv6 FORWARD even defaults to ACCEPT).
+insert_rule_if_missing() { # <table> <chain> <rule...>
+  local table="$1" chain="$2"; shift 2
+  if ! "$IPTABLES_BIN" -t "$table" -C "$chain" "$@" >/dev/null 2>&1; then
+    "$IPTABLES_BIN" -t "$table" -I "$chain" 1 "$@" >/dev/null
+  fi
+}
+
+insert6_rule_if_missing() { # <table> <chain> <rule...>
+  local table="$1" chain="$2"; shift 2
+  if ! "$IP6TABLES_BIN" -t "$table" -C "$chain" "$@" >/dev/null 2>&1; then
+    "$IP6TABLES_BIN" -t "$table" -I "$chain" 1 "$@" >/dev/null
   fi
 }
 
@@ -324,18 +343,24 @@ apply_ap_rules() {
   while IFS= read -r rule; do
     "$IPTABLES_BIN" -t nat -A "$AP_CHAIN" $rule
   done < <(ap_chain_rules)
-  add_rule_if_missing nat PREROUTING -i "$AP_INTERFACE" -j "$AP_CHAIN"
+  insert_rule_if_missing nat PREROUTING -i "$AP_INTERFACE" -j "$AP_CHAIN"
 
   log "AP mode: ${AP_INTERFACE} is guest-only (DNS, DHCP, tor-TransPort, then DROP; no forwarding, no IPv6)"
+  # Reapplying must not open a hole: the jump into AP_IN_CHAIN stays live while
+  # the chain is refilled, and INPUT's policy is ACCEPT, so flushing it in
+  # place would accept every guest packet in between. Drop guest input ahead of
+  # everything for the refill, then take the guard back out.
+  insert_rule_if_missing filter INPUT -i "$AP_INTERFACE" -j DROP
   chain_reset filter "$AP_IN_CHAIN"
   while IFS= read -r rule; do
     "$IPTABLES_BIN" -t filter -A "$AP_IN_CHAIN" $rule
   done < <(ap_filter_rules)
-  add_rule_if_missing filter INPUT -i "$AP_INTERFACE" -j "$AP_IN_CHAIN"
-  add_rule_if_missing filter FORWARD -i "$AP_INTERFACE" -j DROP
+  insert_rule_if_missing filter INPUT -i "$AP_INTERFACE" -j "$AP_IN_CHAIN"
+  delete_rule_if_present filter INPUT -i "$AP_INTERFACE" -j DROP
+  insert_rule_if_missing filter FORWARD -i "$AP_INTERFACE" -j DROP
   # Guests are never routed anywhere by this host: tor captures their TCP.
-  add6_rule_if_missing filter INPUT -i "$AP_INTERFACE" -j DROP
-  add6_rule_if_missing filter FORWARD -i "$AP_INTERFACE" -j DROP
+  insert6_rule_if_missing filter INPUT -i "$AP_INTERFACE" -j DROP
+  insert6_rule_if_missing filter FORWARD -i "$AP_INTERFACE" -j DROP
 }
 
 flush_ap_rules() {
@@ -345,6 +370,7 @@ flush_ap_rules() {
   log "AP mode: removing hooks and chains for ${AP_INTERFACE}"
   delete_rule_if_present nat PREROUTING -i "$AP_INTERFACE" -j "$AP_CHAIN"
   delete_rule_if_present filter INPUT -i "$AP_INTERFACE" -j "$AP_IN_CHAIN"
+  delete_rule_if_present filter INPUT -i "$AP_INTERFACE" -j DROP
   delete_rule_if_present filter FORWARD -i "$AP_INTERFACE" -j DROP
   chain_drop nat "$AP_CHAIN"
   chain_drop filter "$AP_IN_CHAIN"

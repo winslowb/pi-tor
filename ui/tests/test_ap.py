@@ -55,6 +55,12 @@ esac
 IP_STUB = """#!/bin/sh
 printf 'ip %s\\n' "$*" >> "$AP_CALLS"
 case "$*" in
+  "-o -4 addr show")
+    printf '2: wlan0    inet 192.168.0.188/24 brd 192.168.0.255 scope global wlan0\\n'
+    if [ "${AP_TEST_ADDR_CONFLICT:-}" = 1 ]; then
+      printf '9: lan0     inet 10.12.195.7/24 brd 10.12.195.255 scope global lan0\\n'
+    fi
+    exit 0 ;;
   "-o -4 addr show dev uap0")
     [ -f "$AP_ROOT/addr" ] && cat "$AP_ROOT/addr"
     exit 0 ;;
@@ -62,8 +68,22 @@ case "$*" in
   "addr add 10.12.195.1/24 dev uap0")
     printf 'inet 10.12.195.1/24 scope global uap0\\n' > "$AP_ROOT/addr" ;;
   "link del uap0")
+    [ "${AP_TEST_IP_DEL_FAIL:-}" = 1 ] && exit 1
     rm -rf "$AP_NET_DIR/uap0" "$AP_SYSCTL_DIR/uap0"; rm -f "$AP_ROOT/addr" ;;
   *) exit 2 ;;
+esac
+"""
+
+SS_STUB = """#!/bin/sh
+printf 'ss %s\\n' "$*" >> "$AP_CALLS"
+case "$*" in
+  "-Hltn")
+    [ "${AP_TEST_NO_TRANS:-}" = 1 ] || printf 'LISTEN 0 4096 10.12.194.1:9040 0.0.0.0:*\\n'
+    exit 0 ;;
+  "-Hlun")
+    [ "${AP_TEST_NO_DNS:-}" = 1 ] || printf 'UNCONN 0 0 10.12.194.1:53 0.0.0.0:*\\n'
+    exit 0 ;;
+  *) exit 1 ;;
 esac
 """
 
@@ -124,6 +144,7 @@ class Fixture:
         _write(self.stubbin / "hostapd", HOSTAPD_STUB)
         _write(self.stubbin / "dnsmasq", DNSMASQ_STUB)
         _write(self.stubbin / "ip6tables", IP6_STUB)
+        _write(self.stubbin / "ss", SS_STUB)
 
     def env(self, **over):
         env = dict(os.environ)
@@ -144,6 +165,9 @@ class Fixture:
             PI_TOR_RULES=str(RULES),
             PI_TOR_AP_WAIT="1",
             PI_TOR_FAKE_ROOT="1",
+            PI_TOR_AP_ENVFILE=str(self.root / "no-such-env-file"),
+            PI_TOR_SS=str(self.stubbin / "ss"),
+            PI_TOR_FAKE_LOG=str(self.calls_log),
             PI_TOR_AP_INTERFACE="uap0",
             PI_TOR_AP_SUBNET="10.12.195.0/24",
             PI_TOR_AP_GATEWAY="10.12.195.1",
@@ -155,7 +179,12 @@ class Fixture:
             IP6TABLES_BIN=str(self.stubbin / "ip6tables"),
             PI_TOR_FAKE_STATE=str(self.state),
         )
-        env.update(over)
+        # None drops a key entirely: "unset" and "set to empty" differ
+        for key, val in over.items():
+            if val is None:
+                env.pop(key, None)
+            else:
+                env[key] = val
         return env
 
     def run(self, *args, **over):
@@ -311,6 +340,105 @@ class ApUpTest(unittest.TestCase):
                 self.assertNotIn(mutation, call, f"plan mutated: {call}")
         self.assertFalse(self.fx.state.exists())
 
+    def test_up_reads_the_env_file_instead_of_the_argv(self):
+        cfg = self.fx.root / "default-pi-tor-ap"
+        cfg.write_text(
+            "# the file systemd loads for the unit\n"
+            'PI_TOR_AP_SSID="Guest Net"\n'
+            f"PI_TOR_AP_PSK={PSK}\n"
+            "\n"
+            "PI_TOR_AP_SUBNET=10.12.195.0/24\n"
+            "PI_TOR_AP_GATEWAY=10.12.195.1\n"
+        )
+        res = self.fx.run("up", PI_TOR_AP_ENVFILE=str(cfg),
+                          PI_TOR_AP_SSID=None, PI_TOR_AP_PSK=None)
+        self.assertEqual(res.returncode, 0, res.stdout + res.stderr)
+        conf = (self.fx.rundir / "hostapd.conf").read_text()
+        self.assertIn("ssid=Guest Net", conf)
+        self.assertIn(f"wpa_passphrase={PSK}", conf)
+        # every stub logs its argv: the secret never travels on one
+        self.assertNotIn(PSK, "\n".join(self.fx.calls()))
+
+    def test_env_file_is_parsed_not_executed(self):
+        marker = self.fx.root / "pwned"
+        cfg = self.fx.root / "default-pi-tor-ap"
+        cfg.write_text(
+            "PI_TOR_AP_SSID=Guests\n"
+            f"PI_TOR_AP_PSK={PSK}\n"
+            f"PI_TOR_AP_EVIL=$(touch {marker})\n"
+            f"SHELL_COMMAND=`touch {marker}`\n"
+            # a PATH the loader must not adopt: the run could not mkdir/chmod
+            "PATH=/nonexistent\n"
+        )
+        res = self.fx.run("up", PI_TOR_AP_ENVFILE=str(cfg),
+                          PI_TOR_AP_SSID=None, PI_TOR_AP_PSK=None)
+        self.assertEqual(res.returncode, 0, res.stdout + res.stderr)
+        self.assertFalse(marker.exists(), "the env file must never be executed")
+        self.assertIn("ssid=Guests", (self.fx.rundir / "hostapd.conf").read_text())
+
+    def test_up_refuses_a_gateway_that_is_not_a_usable_host(self):
+        for gw in ("10.12.195.0", "10.12.195.255"):
+            res = self.fx.run("up", PI_TOR_AP_GATEWAY=gw)
+            self.assertNotEqual(res.returncode, 0, gw)
+            self.assertIn("not a usable host address", res.stderr)
+        self.assertEqual(self.fx.calls(), [])
+        self.assertFalse(self.fx.rundir.exists())
+
+    def test_up_refuses_an_invalid_or_gateway_containing_dhcp_pool(self):
+        cases = (
+            ({"PI_TOR_AP_DHCP_START": "10.12.196.10"}, "not inside PI_TOR_AP_SUBNET"),
+            ({"PI_TOR_AP_DHCP_END": "10.12.195.255"}, "not a usable host address"),
+            ({"PI_TOR_AP_DHCP_START": "10.12.195.9", "PI_TOR_AP_DHCP_END": "10.12.195.9a"},
+             "is not an IPv4 address"),
+            ({"PI_TOR_AP_DHCP_START": "10.12.195.200", "PI_TOR_AP_DHCP_END": "10.12.195.150"},
+             "is above"),
+            ({"PI_TOR_AP_DHCP_START": "10.12.195.1", "PI_TOR_AP_DHCP_END": "10.12.195.99"},
+             "is inside the DHCP pool"),
+        )
+        for over, msg in cases:
+            res = self.fx.run("up", **over)
+            self.assertNotEqual(res.returncode, 0, over)
+            self.assertIn(msg, res.stderr, over)
+        self.assertEqual(self.fx.calls(), [])
+        self.assertFalse(self.fx.rundir.exists())
+
+    def test_up_refuses_a_subnet_the_board_already_has_an_address_in(self):
+        res = self.fx.run("up", AP_TEST_ADDR_CONFLICT="1")
+        self.assertNotEqual(res.returncode, 0)
+        self.assertIn("already configured on this host", res.stderr)
+        self.assertFalse((self.fx.net / "uap0").exists())
+        self.assertIsNone(self.fx.chain("nat", "PI_TOR_AP_REDIRECT"))
+
+    def test_up_refuses_any_overlap_with_the_tether_subnet(self):
+        # the guest /24 is compared to the tether's, not the two subnet strings:
+        # this pair used to differ textually and still share 10.12.194.0/24
+        res = self.fx.run("up", PI_TOR_AP_SUBNET="10.12.194.128/24",
+                          PI_TOR_AP_GATEWAY="10.12.194.200",
+                          PI_TOR_AP_DHCP_START="10.12.194.201",
+                          PI_TOR_AP_DHCP_END="10.12.194.250")
+        self.assertNotEqual(res.returncode, 0)
+        self.assertIn("must not overlap the tether subnet", res.stderr)
+        self.assertEqual(self.fx.calls(), [])
+
+    def test_up_refuses_when_pihole_or_tor_is_not_listening(self):
+        for over, msg in (({"AP_TEST_NO_TRANS": "1"}, "no egress"),
+                          ({"AP_TEST_NO_DNS": "1"}, "no resolver")):
+            res = self.fx.run("up", **over)
+            self.assertNotEqual(res.returncode, 0, over)
+            self.assertIn(msg, res.stderr, over)
+        # refused before serving anything: no interface, no rules, no leases
+        self.assertFalse((self.fx.net / "uap0").exists())
+        self.assertIsNone(self.fx.chain("nat", "PI_TOR_AP_REDIRECT"))
+        self.assertFalse(self.fx.rundir.exists())
+
+    def test_rollback_reports_an_incomplete_teardown_instead_of_aborting(self):
+        res = self.fx.run("up", AP_TEST_HOSTAPD_FAIL="1", AP_TEST_IP_DEL_FAIL="1")
+        self.assertNotEqual(res.returncode, 0)
+        self.assertIn("refused to start", res.stderr)
+        self.assertTrue((self.fx.net / "uap0").exists(), "the stub did not fail the delete")
+        # down() dies on the incomplete teardown; the trap must still report it
+        self.assertIn("WARNING: rollback incomplete", res.stdout + res.stderr)
+
 
 class ApRulesTest(unittest.TestCase):
 
@@ -339,11 +467,15 @@ class ApRulesTest(unittest.TestCase):
         self.assertIsNotNone(acl)
         self.assertEqual(acl[-1], "-i uap0 -j DROP", f"the chain must end in DROP: {acl}")
         accepts = [l for l in acl if l.endswith("-j ACCEPT")]
-        self.assertEqual(len(accepts), 4, acl)
-        self.assertIn("-i uap0 -p udp -d 10.12.194.1 --dport 53 -j ACCEPT", acl)
-        self.assertIn("-i uap0 -p tcp -d 10.12.194.1 --dport 53 -j ACCEPT", acl)
-        self.assertIn("-i uap0 -p udp --dport 67 -j ACCEPT", acl)
-        self.assertIn("-i uap0 -p tcp -d 10.12.194.1 --dport 9040 -j ACCEPT", acl)
+        self.assertEqual(len(accepts), 5, acl)
+        self.assertIn("-i uap0 -s 10.12.195.0/24 -p udp -d 10.12.194.1 --dport 53 -j ACCEPT", acl)
+        self.assertIn("-i uap0 -s 10.12.195.0/24 -p tcp -d 10.12.194.1 --dport 53 -j ACCEPT", acl)
+        self.assertIn("-i uap0 -s 10.12.195.0/24 -p tcp -d 10.12.194.1 --dport 9040 -j ACCEPT", acl)
+        # DHCP: the no-lease bootstrap and a renewal, both pinned to DHCP's pair
+        self.assertIn("-i uap0 -s 0.0.0.0/32 -p udp -d 255.255.255.255 "
+                      "--sport 68 --dport 67 -j ACCEPT", acl)
+        self.assertIn("-i uap0 -s 10.12.195.0/24 -p udp -d 10.12.195.1 "
+                      "--sport 68 --dport 67 -j ACCEPT", acl)
         # management ports are not open to guests
         for port in ("--dport 22", "--dport 80", "--dport 8080"):
             self.assertFalse(any(port in l for l in acl), f"{port} exposed to guests: {acl}")
@@ -355,6 +487,84 @@ class ApRulesTest(unittest.TestCase):
                          ["-i uap0 -j DROP"])
         self.assertEqual(self.fx.chain("filter", "FORWARD", self.fx.state6),
                          ["-i uap0 -j DROP"])
+
+    def _seed(self, table, chain, rule, state=None):
+        """Pre-seed a chain the way Docker, a distro firewall or a stale run would."""
+        f = Path(state or self.fx.state) / table / chain
+        f.parent.mkdir(parents=True, exist_ok=True)
+        with f.open("a") as fh:
+            fh.write(rule + "\n")
+
+    def test_ap_input_accepts_are_scoped_to_the_guest_subnet(self):
+        self.assertEqual(self.fx.rules("apply-ap").returncode, 0)
+        acl = self.fx.chain("filter", "PI_TOR_AP_IN")
+        for rule in [l for l in acl if l.endswith("-j ACCEPT")]:
+            self.assertTrue(
+                "-s 10.12.195.0/24" in rule or "-s 0.0.0.0/32" in rule,
+                f"an ACCEPT without a pinned source takes spoofed LAN traffic: {rule}")
+        # the one unscoped-source accept has nothing but DHCP to talk to
+        boot = [l for l in acl if "-s 0.0.0.0/32" in l]
+        self.assertEqual(len(boot), 1, acl)
+        self.assertIn("-d 255.255.255.255", boot[0])
+        self.assertIn("--sport 68 --dport 67", boot[0])
+
+    def test_ap_hooks_land_ahead_of_preseeded_broad_accepts(self):
+        # a hostile/legacy ruleset installed before the AP: broad ACCEPTs that
+        # would swallow every guest packet if the AP hooks were appended
+        for chain in ("INPUT", "FORWARD"):
+            self._seed("filter", chain, "-p tcp -j ACCEPT")
+            self._seed("filter", chain, "-i uap0 -j ACCEPT")
+            self._seed("filter", chain, "-j ACCEPT", state=self.fx.state6)
+        self._seed("nat", "PREROUTING",
+                   "-p tcp --dport 53 -j DNAT --to-destination 172.17.0.2:53")
+
+        res = self.fx.rules("apply-ap")
+        self.assertEqual(res.returncode, 0, res.stdout + res.stderr)
+
+        # position 1 everywhere: nothing earlier can accept the packet first
+        self.assertEqual(self.fx.chain("filter", "INPUT")[0], "-i uap0 -j PI_TOR_AP_IN")
+        self.assertEqual(self.fx.chain("filter", "FORWARD")[0], "-i uap0 -j DROP")
+        self.assertEqual(self.fx.chain("filter", "INPUT", self.fx.state6)[0],
+                         "-i uap0 -j DROP")
+        self.assertEqual(self.fx.chain("filter", "FORWARD", self.fx.state6)[0],
+                         "-i uap0 -j DROP")
+        self.assertEqual(self.fx.chain("nat", "PREROUTING")[0],
+                         "-i uap0 -j PI_TOR_AP_REDIRECT")
+        # the seeded rules survive, behind the AP's
+        self.assertIn("-p tcp -j ACCEPT", self.fx.chain("filter", "INPUT")[1:])
+
+    def test_flush_ap_removes_the_hooks_from_a_preseeded_ruleset(self):
+        self._seed("filter", "INPUT", "-p tcp -j ACCEPT")
+        self._seed("filter", "FORWARD", "-j ACCEPT", state=self.fx.state6)
+        self.assertEqual(self.fx.rules("apply-ap").returncode, 0)
+        self.assertEqual(self.fx.rules("flush-ap").returncode, 0)
+
+        self.assertEqual(self.fx.chain("filter", "INPUT"), ["-p tcp -j ACCEPT"])
+        self.assertEqual(self.fx.chain("filter", "FORWARD", self.fx.state6), ["-j ACCEPT"])
+        self.assertEqual(self.fx.chain("nat", "PREROUTING"), [])
+        self.assertIsNone(self.fx.chain("filter", "PI_TOR_AP_IN"))
+        self.assertIsNone(self.fx.chain("nat", "PI_TOR_AP_REDIRECT"))
+
+    def test_reapply_never_exposes_an_unfiltered_window(self):
+        self.assertEqual(self.fx.rules("apply-ap").returncode, 0)
+        seen = len(self.fx.calls())
+        self.assertEqual(self.fx.rules("apply-ap").returncode, 0)
+
+        log = self.fx.calls()[seen:]
+        guard_in = "iptables -t filter -I INPUT 1 -i uap0 -j DROP"
+        guard_out = "iptables -t filter -D INPUT -i uap0 -j DROP"
+        flush = "iptables -t filter -F PI_TOR_AP_IN"
+        refill = [i for i, call in enumerate(log)
+                  if call == "iptables -t filter -A PI_TOR_AP_IN -i uap0 -j DROP"]
+        self.assertIn(guard_in, log, log)
+        self.assertIn(flush, log, log)
+        self.assertTrue(refill, log)
+        # the guest DROP covers the flush/refill, and only then comes back out
+        self.assertLess(log.index(guard_in), log.index(flush),
+                        "the guest chain was flushed while it was still reachable")
+        self.assertLess(refill[-1], log.index(guard_out),
+                        "the temporary DROP was removed before the refill finished")
+        self.assertEqual(self.fx.chain("filter", "PI_TOR_AP_IN")[-1], "-i uap0 -j DROP")
 
     def test_flush_ap_leaves_the_tether_rules_alone(self):
         self.assertEqual(self.fx.rules("apply").returncode, 0)
