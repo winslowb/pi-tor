@@ -39,6 +39,7 @@ case "$*" in
       printf '\\tchannel 149 (5745 MHz), width: 80 MHz, center1: 155 MHz\\n'
     fi ;;
   "dev uap0 info")
+    [ "${AP_TEST_NO_AP:-}" = 1 ] && exit 1
     printf 'Interface uap0\\n\\ttype AP\\n\\tchannel 149 (5745 MHz), width: 20 MHz\\n' ;;
   "dev wlan0 link")
     if [ "${AP_TEST_NO_LINK:-}" = 1 ]; then
@@ -344,6 +345,44 @@ class ApUpTest(unittest.TestCase):
                              "dnsmasq", "ip6tables"):
                 self.assertNotIn(mutation, call, f"plan mutated: {call}")
         self.assertFalse(self.fx.state.exists())
+
+    def test_plan_leaves_running_daemons_untouched(self):
+        # a live AP already has hostapd and dnsmasq running: `plan` used to
+        # dispatch into up(), whose teardown stopped both before it printed
+        self.fx.rundir.mkdir(mode=0o700)
+        pids = {}
+        try:
+            for name in ("hostapd.pid", "dnsmasq.pid"):
+                proc = subprocess.Popen(["sleep", "60"])
+                pids[name] = proc
+                (self.fx.rundir / name).write_text(f"{proc.pid}\n")
+            for arg in ("plan", "--dry-run"):
+                res = self.fx.run(arg)
+                self.assertEqual(res.returncode, 0, arg + res.stdout + res.stderr)
+                self.assertIn("channel 149", res.stdout, arg)
+                self.assertIn("hostapd -B", res.stdout, arg)
+                for name, proc in pids.items():
+                    self.assertTrue((self.fx.rundir / name).exists(),
+                                    f"{arg} removed {name}")
+                    self.assertEqual((self.fx.rundir / name).read_text(),
+                                     f"{proc.pid}\n", f"{arg} rewrote {name}")
+                    self.assertIsNone(proc.poll(), f"{arg} stopped pid {proc.pid}")
+                self.assertFalse(any(c.startswith(("hostapd ", "dnsmasq "))
+                                     for c in self.fx.calls()),
+                                 f"{arg} started a daemon")
+        finally:
+            for proc in pids.values():
+                proc.kill()
+                proc.wait()
+
+    def test_plan_succeeds_when_the_ap_interface_is_absent(self):
+        # the live failure: uap0 did not exist, so the start verification plan
+        # fell into died with "uap0 is not in AP mode after start"
+        res = self.fx.run("plan", AP_TEST_NO_AP="1")
+        self.assertEqual(res.returncode, 0, res.stdout + res.stderr)
+        self.assertNotIn("not in AP mode", res.stderr)
+        self.assertIn("apply-ap", res.stdout)
+        self.assertFalse((self.fx.net / "uap0").exists())
 
     def test_up_reads_the_env_file_instead_of_the_argv(self):
         cfg = self.fx.root / "default-pi-tor-ap"

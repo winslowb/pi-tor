@@ -19,7 +19,7 @@
 #           down and exits nonzero (no half-live AP)
 #   down    stop both daemons, delete the interface, flush the AP rules
 #   status  report interface/channel/daemon state; exit 0 when hostapd runs
-#   plan    print the resolved plan; writes and starts nothing
+#   plan    print the resolved plan; writes, starts and stops nothing
 #
 # The Wi-Fi secret is PI_TOR_AP_PSK from /etc/default/pi-tor-ap (mode 0600).
 # There is no open mode and no default secret: an empty or too-short PSK is
@@ -459,6 +459,17 @@ cleanup_failed_start() {
 
 up() {
   preflight
+  if [ "$MODE" = dry ]; then
+    # `plan`: print the resolved plan and stop. Nothing is stopped, written,
+    # created or verified, so it is safe to run while the AP is live.
+    write_confs
+    rules
+    iface_up
+    start_hostapd
+    start_dnsmasq
+    log "plan: nothing was written, started or stopped"
+    return 0
+  fi
   require_root
   listeners_ok
   trap cleanup_failed_start EXIT
