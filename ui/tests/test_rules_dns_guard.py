@@ -14,6 +14,7 @@ docker starts any container) and `flush` reinstalls it instead of removing it.
 """
 import shutil
 import subprocess
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -254,6 +255,44 @@ class StartupGuardTest(unittest.TestCase):
         self.assertTrue([l for l in lines
                          if l.startswith("ExecStart=/usr/bin/docker compose up")],
                         lines)
+
+    def test_guard_is_a_hard_dependency_of_docker_not_just_ordering(self):
+        """`Before=` alone only orders jobs in one transaction.
+
+        Containers carry `restart=unless-stopped`, so dockerd auto-starts FTL
+        without `pi-tor-stack.service` ever running: docker.service itself has
+        to require the guard, and require -- not want -- so a guard that cannot
+        be installed stops docker instead of leaving :53 open.
+        """
+        lines = _directives(UNIT_GUARD)
+        before = [l for l in lines if l.startswith("Before=")]
+        self.assertEqual(len(before), 1, before)
+        self.assertIn("docker.service", before[0].split("=", 1)[1].split())
+        required_by = [l for l in lines if l.startswith("RequiredBy=")]
+        self.assertEqual(required_by, ["RequiredBy=docker.service"], required_by)
+
+    @unittest.skipUnless(shutil.which("systemctl"), "needs systemctl --root")
+    def test_enabling_the_guard_wires_it_into_docker(self):
+        """The installer's `systemctl enable` is what creates the dependency:
+        prove it lands in docker.service.requires/ (blocking), not .wants/."""
+        with tempfile.TemporaryDirectory() as tmp:
+            unitdir = Path(tmp) / "etc" / "systemd" / "system"
+            unitdir.mkdir(parents=True)
+            (unitdir / "docker.service").write_text(
+                "[Unit]\nDescription=fake docker\n"
+                "[Service]\nType=notify\nExecStart=/bin/true\n")
+            shutil.copy(UNIT_GUARD, unitdir / UNIT_GUARD.name)
+            res = subprocess.run(
+                ["systemctl", "--root=" + tmp, "enable", UNIT_GUARD.name],
+                capture_output=True, text=True)
+            self.assertEqual(res.returncode, 0, res.stderr)
+            requires = unitdir / "docker.service.requires" / UNIT_GUARD.name
+            wants = unitdir / "docker.service.wants" / UNIT_GUARD.name
+            self.assertTrue(requires.is_symlink(),
+                            "no docker.service.requires link: "
+                            + ", ".join(sorted(p.name for p in unitdir.iterdir())))
+            self.assertFalse(wants.exists(),
+                             "a wants= link would not fail docker")
 
     def test_readme_installs_the_guard_before_the_stack(self):
         text = (REPO / "README.md").read_text()

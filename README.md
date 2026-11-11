@@ -36,9 +36,12 @@ A minimal Docker stack for a USB-gadget Raspberry Pi that runs Pi-hole as the DN
   log line per second, addresses scraped from the mounted `torrc`) for the
   gadget-subnet binds to become assignable, so a `usb0` that is attached
   but not yet addressed does not crash-loop tor
-- Optional systemd unit for auto-starting the stack on boot (the firewall
-  rules are applied by the ui container when it starts, so there is no
-  separate rules unit to enable or remember)
+- Optional systemd units for auto-starting the stack on boot, including
+  `systemd/pi-tor-guard.service`, which is a **required** dependency of
+  `docker.service`: dockerd will not start containers unless the `:53`
+  guard was installed first, so a failed guard fails Docker instead of
+  leaving FTL open. It is the one rules unit, and the ui container's startup
+  apply only refreshes what it installed
 - A small configuration web UI (`ui/`) that renders every config file from
   one validated schema, previews diffs, applies with backup + restart, and
   can roll back — see [ui/README.md](ui/README.md). Note: the ui container
@@ -183,28 +186,47 @@ kernel in chains docker does not own. To have the stack come up on boot:
            /etc/systemd/system/
    ```
 3. `sudo systemctl daemon-reload`
-4. Enable the guard first, then the stack:
+4. Enable the guard **first**, then the stack:
    ```bash
    sudo systemctl enable --now pi-tor-guard.service
    sudo systemctl enable --now pi-tor-stack.service
    ```
 
+`systemctl enable` on the guard is what wires it into Docker: the unit
+carries `RequiredBy=docker.service`, so enabling creates
+`/etc/systemd/system/docker.service.requires/pi-tor-guard.service`, and
+`Before=docker.service` orders the guard ahead of dockerd. Docker therefore
+pulls the guard in on any start, including a boot where nothing but
+`restart=unless-stopped` would bring Pi-hole back — and because the
+dependency is `Requires`, a guard that fails to start fails
+`docker.service`, so FTL never binds `:53` unguarded. Do this before
+changing `listeningMode` to `ALL` or restarting Docker; if the guard unit
+fails, do not bring the stack up.
+
 Keep `/etc/default/pi-tor` in step with what the config UI renders into
 `.env`: the guard allows DNS on the interface and subnets it is given, so a
 tether interface changed in the UI but not there loses DNS over the tether
-(closed, never open — the fix is to update the file and
-`systemctl restart pi-tor-guard.service`).
+(closed, never open — the fix is to update the file and re-run
+`sudo bin/pi-tor-rules.sh guard`). Re-running the script is deliberate:
+`Requires` runs both ways, so `systemctl restart pi-tor-guard.service` also
+stops `docker.service` and every container with it (fail-closed, but the
+stack stays down until you `systemctl start pi-tor-stack.service` again).
 
 `pi-tor-stack` runs `docker compose up -d --build` from `/opt/pi-tor` on
-boot and carries `Requires=pi-tor-guard.service` with `After=` it, so enabling
-only the stack still starts the guard first — and a guard that cannot be
-installed fails the stack instead of leaving Pi-hole unguarded. The ui container inside the stack
-re-applies the same rules (idempotent) — that is a refresh, not the boundary.
+boot and also carries `Requires=pi-tor-guard.service` with `After=` it, so no
+route into FTL — the stack unit, a plain boot, or Docker's own
+`restart=unless-stopped` — can start Pi-hole before the guard ran: the guard
+is a required dependency of `docker.service` itself, and a guard that cannot
+be installed fails both. The ui container inside the stack re-applies the same
+rules (idempotent) — that is a refresh, not the boundary.
 
-Starting the stack by hand instead of through the unit (`docker compose up -d
---build` from the quick start) skips the guard unit; the ui container then
-closes the window once it starts, exactly as before. Run
-`sudo bin/pi-tor-rules.sh guard` first if you want it shut from the start.
+Starting the stack by hand (`docker compose up -d --build` from the quick
+start) is guarded the same way, because the dependency hangs off Docker, not
+off the stack unit. The one window left is a `dockerd` that was already
+running before the guard unit was installed: no systemd job starts, so no
+guard. Run `sudo bin/pi-tor-rules.sh guard` first (or `systemctl restart
+docker`, which starts the guard before it) — the ui container's startup apply
+would only close the window after FTL had already bound `:53`.
 
 `bin/pi-tor-rules.sh` remains the single implementation:
 `apply|guard|flush|show-rules` (plus `apply-ap|flush-ap` for the guest AP).
@@ -361,11 +383,15 @@ git archive --format=tar.gz --prefix=pi-tor/ HEAD |
   ssh <board> 'sudo tar -xz -C /opt'
 
 # on the board, in /opt/pi-tor
-sudo cp systemd/pi-tor-gadget.service systemd/pi-tor-stack.service \
+sudo cp systemd/pi-tor-guard.service systemd/pi-tor-gadget.service \
+        systemd/pi-tor-stack.service \
         systemd/pi-tor-gadget-watchdog.service /etc/systemd/system/
 sudo cp -r systemd/pi-tor-gadget-watchdog.service.d /etc/systemd/system/
 sudo cp systemd/pi-tor.env.example /etc/default/pi-tor   # edit if not usb0/10.12.194.x
 sudo systemctl daemon-reload
+# the guard first: `enable` is what makes it a required dependency of
+# docker.service, and it also installs the :53 rules right now
+sudo systemctl enable --now pi-tor-guard.service
 sudo systemctl enable --now pi-tor-gadget.service pi-tor-gadget-watchdog.service
 sudo systemctl enable --now pi-tor-stack.service
 
@@ -384,8 +410,9 @@ carries `Wants=pi-tor-gadget.service` as well as
 still starts the gadget; `Wants` rather than `Requires` means a gadget
 failure is logged instead of holding the stack back, and the UI then
 explains the missing tether. `pi-tor-guard.service` is the one rules unit
-there is, and it runs `Before=docker.service`; the ui container's startup
-apply only refreshes what it installed.
+there is: `Before=docker.service` plus `RequiredBy=docker.service`, so dockerd
+starts it first and refuses to start at all if it fails; the ui container's
+startup apply only refreshes what it installed.
 
 `up` is idempotent even over a partially torn-down gadget: an unbound but
 composed one is reused, and `ifname` is not rewritten (configfs refuses that
@@ -490,9 +517,10 @@ one is worse than no key.
 The tradeoff is deliberate and it is the firewall, not FTL, that is now the
 boundary — which is why nothing in this repo takes it down: `flush` removes the
 tether redirect and then re-installs the guard, and
-`systemd/pi-tor-guard.service` installs it before docker starts Pi-hole, so
-there is no boot window either. Two things the guard has to cover that FTL
-cannot:
+`systemd/pi-tor-guard.service` installs it before docker starts Pi-hole
+(`docker.service` requires the guard, so a failed guard stops Docker rather
+than warn), so there is no boot window either. Two things the guard has to
+cover that FTL cannot:
 
 - **IPv6.** `ALL` binds `::` as well as `0.0.0.0`, so the same policy is
   installed in `ip6tables`: loopback only, because nothing else here has IPv6

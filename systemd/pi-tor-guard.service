@@ -8,6 +8,10 @@ Documentation=https://github.com/winslowb/pi-tor#why-all-plus-a-firewall-guard-n
 # too late for the window this unit closes. docker restarts keep the rules
 # (they live in the kernel, in chains docker does not own), so one boot-time
 # run covers them.
+# Before= only orders jobs in one transaction, and docker auto-starts FTL on
+# its own (restart=unless-stopped), so the guard is a hard dependency of
+# docker.service -- see RequiredBy= in [Install]. Ordering alone would let a
+# failed guard leave dockerd starting an unguarded resolver.
 After=local-fs.target
 Before=docker.service pi-tor-stack.service
 
@@ -17,8 +21,14 @@ RemainAfterExit=yes
 EnvironmentFile=-/etc/default/pi-tor
 # literal absolute path: systemd cannot expand a variable into one
 # Fails closed: with no ip6tables the script refuses to run, this unit fails,
-# and docker never starts an unguarded FTL.
+# docker.service fails with it (RequiredBy below), and FTL never binds :53
+# unguarded.
 ExecStart=/opt/pi-tor/bin/pi-tor-rules.sh guard
 
 [Install]
 WantedBy=multi-user.target
+# RequiredBy, so the dependency is Requires (a docker.service.requires/ link
+# made by `systemctl enable`) and not a Wants that would only warn: a guard
+# that cannot be installed must stop docker. Note it runs both ways -- a guard
+# restart stops docker.service too.
+RequiredBy=docker.service
