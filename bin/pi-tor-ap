@@ -29,8 +29,8 @@
 #
 # Test seams: PI_TOR_AP_RUNDIR, PI_TOR_NET_DIR, PI_TOR_AP_SYSCTL_DIR,
 # PI_TOR_IW, PI_TOR_IP, PI_TOR_HOSTAPD, PI_TOR_DNSMASQ, PI_TOR_RULES,
-# PI_TOR_AP_WAIT, PI_TOR_FAKE_ROOT, PI_TOR_AP_ENVFILE, PI_TOR_SS (plus the
-# env pi-tor-rules.sh reads).
+# PI_TOR_AP_WAIT, PI_TOR_FAKE_ROOT, PI_TOR_AP_ENVFILE, PI_TOR_AP_TEMPLATE,
+# PI_TOR_SS (plus the env pi-tor-rules.sh reads).
 set -u
 
 log() { printf '[pi-tor-ap] %s\n' "$*"; }
@@ -82,7 +82,13 @@ load_env_file() { # <path>
   done < "$1"
 }
 
-load_env_file "${PI_TOR_AP_ENVFILE:-/etc/default/pi-tor-ap}"
+LIVE_ENV=${PI_TOR_AP_ENVFILE:-/etc/default/pi-tor-ap}
+# The non-secret template the live file is installed from. tor's SocksPolicy
+# and the config UI's :53 guard are rendered from it, never from the live file
+# (mode 0600: it also holds the PSK).
+AP_TEMPLATE=${PI_TOR_AP_TEMPLATE:-$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)/systemd/pi-tor-ap.env.example}
+
+load_env_file "$LIVE_ENV"
 
 AP_IF=${PI_TOR_AP_INTERFACE:-uap0}
 AP_SUBNET=${PI_TOR_AP_SUBNET:-10.12.195.0/24}
@@ -185,6 +191,31 @@ rundir_ok() {
     die "PI_TOR_AP_RUNDIR ($RUNDIR) must be $DEFAULT_RUNDIR: 'down' deletes it, so no other path is safe"
 }
 
+template_value() { # <key>: the template's value, empty when absent
+  [ -r "$AP_TEMPLATE" ] || return 0
+  sed -n "s/^[[:space:]]*$1[[:space:]]*=[[:space:]]*//p" "$AP_TEMPLATE" |
+    sed -n 1p
+}
+
+# tor's SocksPolicy and the config UI's :53 guard are rendered from the
+# non-secret template; neither can read this live file, which holds the PSK.
+# A live interface/subnet the template does not name puts guests on a net both
+# drop - closed, but with no DNS - so refuse instead of serving a broken AP.
+# An absent file or key means the documented default, which is what the
+# renderer falls back to as well.
+check_template_match() {
+  want_if=$(template_value PI_TOR_AP_INTERFACE)
+  [ -n "$want_if" ] || want_if=uap0
+  if [ "$want_if" != "$AP_IF" ]; then
+    die "PI_TOR_AP_INTERFACE ($AP_IF) in $LIVE_ENV does not match $AP_TEMPLATE ($want_if): the config UI's :53 guard admits the guest net on the template's interface, so guests would be dropped. Set the interface in the template, reinstall it (sudo install -m 0600 $AP_TEMPLATE $LIVE_ENV), re-add the passphrase, then retry."
+  fi
+  want_net=$(template_value PI_TOR_AP_SUBNET)
+  [ -n "$want_net" ] || want_net=10.12.195.0/24
+  if [ "$want_net" != "$AP_SUBNET" ]; then
+    die "PI_TOR_AP_SUBNET ($AP_SUBNET) in $LIVE_ENV does not match $AP_TEMPLATE ($want_net): tor's SocksPolicy and the config UI's :53 guard are rendered from the template, so guests would be dropped (TCP closed, DNS REFUSED). Set the subnet in the template, reinstall it (sudo install -m 0600 $AP_TEMPLATE $LIVE_ENV), re-add the passphrase, then retry."
+  fi
+}
+
 host_in_net() { # <address> <setting>: a usable host in $NET/24; sets LAST
   case $1 in
     '' | *[!0-9.]*) die "$2 ($1) is not an IPv4 address" ;;
@@ -254,6 +285,7 @@ validate() {
     [ "$AP_GW" = "${PI_TOR_GATEWAY:-10.12.194.1}" ]; then
     die "PI_TOR_AP_SUBNET/PI_TOR_AP_GATEWAY must not overlap the tether subnet ($TETHER_SUBNET): the guest DHCP pool would hand out tether addresses"
   fi
+  check_template_match
   if [ "$AP_IF" = "$UPLINK" ]; then
     die "PI_TOR_AP_INTERFACE must differ from PI_TOR_UPLINK ($UPLINK): the uplink has to stay a managed station"
   fi

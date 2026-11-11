@@ -102,9 +102,13 @@ and neither this container nor the renderer reads, mounts or exposes it. Every
 render reads the template, so a UI config save keeps the guest accept in step
 with what `bin/pi-tor-ap` runs instead of dropping it back to the default
 `10.12.195.0/24`; a customised subnet is set in the template and the live file
-reinstalled from it. The interface/subnet also have to reach
-`bin/pi-tor-rules.sh` for the `:53` guard (see the AP section of the
-top-level README). A template value tor cannot parse is ignored in favour of
+reinstalled from it. The same values reach `bin/pi-tor-rules.sh` for the
+`:53` guard: `dockerops.run_rules()` passes the template's subnet as
+`PI_TOR_AP_SUBNET` and its interface as `PI_TOR_AP_GUARD_INTERFACE` on the
+startup apply, every config apply and a rollback — never
+`PI_TOR_AP_INTERFACE`, which would also install the AP chains (see the AP
+section of the top-level README). A template value tor cannot parse is
+ignored in favour of
 the default: tor refuses the whole torrc over one bad `SocksPolicy` line.
 
 `bin/uplink-check.sh` covers the start-ordering gap: after the uplink gate

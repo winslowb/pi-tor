@@ -120,6 +120,29 @@ class DnsGuardTest(unittest.TestCase):
                          EXPECTED6)
         self.assertEqual(sorted(self._hooks()), sorted(HOOKS))
 
+    def test_guard_interface_and_subnet_have_their_own_override(self):
+        # the ui apply knows the guest net/interface but must not set
+        # PI_TOR_AP_INTERFACE: in this script that also enables AP mode
+        res = self.fx.rules("apply", PI_TOR_AP_INTERFACE=None,
+                            PI_TOR_AP_GUARD_INTERFACE="wlan9",
+                            PI_TOR_AP_SUBNET="10.99.0.0/24")
+        self.assertEqual(res.returncode, 0, res.stdout + res.stderr)
+        self.assertEqual(self.fx.chain("filter", "PI_TOR_DNS"),
+                         ["-i lo -j ACCEPT",
+                          "-i usb0 -s 10.12.194.0/24 -j ACCEPT",
+                          "-i wlan9 -s 10.99.0.0/24 -j ACCEPT",
+                          "-j DROP"],
+                         "a customised guest net must be the guard's source")
+        self.assertIsNone(self.fx.chain("nat", "PI_TOR_AP_REDIRECT"),
+                          "a guard override must not install the AP chains")
+        self.assertEqual(self.fx.chain("filter", "INPUT"),
+                         ["-p tcp --dport 53 -j PI_TOR_DNS",
+                          "-p udp --dport 53 -j PI_TOR_DNS",
+                          "-i usb0 -p udp --dport 5353 -j ACCEPT",
+                          "-i usb0 -p udp ! --dport 53 -j DROP",
+                          "-i usb0 -s 10.12.194.0/24 -j ACCEPT"],
+                         "every other rule stays tether-scoped")
+
     def test_flush_keeps_both_dns_guards(self):
         # FTL keeps listening in ALL mode after a flush, so flush may remove
         # the redirect but never the resolver boundary

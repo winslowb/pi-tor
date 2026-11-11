@@ -15,8 +15,9 @@ SocksPolicy accept 10.12.194.0/24
 # to the TransPort first). It is here because this ACL is the gate on every
 # entry listener. The value is PI_TOR_AP_SUBNET from
 # systemd/pi-tor-ap.env.example, the non-secret template the live
-# /etc/default/pi-tor-ap is installed from: a customised guest net must be set
-# there and reinstalled, or this accept drifts from bin/pi-tor-ap.
+# /etc/default/pi-tor-ap is installed from. The config UI reads the same
+# template for this accept and for the :53 guard, and bin/pi-tor-ap refuses to
+# start when the live file's subnet differs from it.
 SocksPolicy accept 10.12.195.0/24
 SocksPolicy reject *
 

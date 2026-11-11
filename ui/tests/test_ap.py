@@ -791,6 +791,63 @@ class ApRulesTest(unittest.TestCase):
         self.assertIsNone(self.fx.chain("nat", "PI_TOR_AP_REDIRECT"))
 
 
+class ApTemplateDriftTest(unittest.TestCase):
+    """The live subnet must equal the non-secret template's.
+
+    tor's SocksPolicy and the config UI's :53 guard are rendered from
+    systemd/pi-tor-ap.env.example, while `up` reads its addressing from the
+    live /etc/default/pi-tor-ap (mode 0600: it also holds the passphrase).
+    A subnet only the live file knows puts guests on a net both drop, so the
+    start is refused rather than serving a broken AP.
+    """
+
+    def setUp(self):
+        self.fx = Fixture()
+
+    def tearDown(self):
+        self.fx.cleanup()
+
+    def template(self, *lines):
+        path = self.fx.root / "pi-tor-ap.env.example"
+        path.write_text("\n".join(lines) + "\n")
+        return path
+
+    def test_plan_accepts_a_live_subnet_the_template_names(self):
+        path = self.template("PI_TOR_AP_INTERFACE=uap0",
+                             "PI_TOR_AP_SUBNET=10.99.0.0/24")
+        res = self.fx.run("plan", PI_TOR_AP_SUBNET="10.99.0.0/24",
+                          PI_TOR_AP_GATEWAY="10.99.0.1",
+                          PI_TOR_AP_TEMPLATE=str(path))
+        self.assertEqual(res.returncode, 0, res.stdout + res.stderr)
+        self.assertIn("PI_TOR_AP_SUBNET=10.99.0.0/24", res.stdout)
+
+    def test_up_refuses_a_live_subnet_the_template_does_not_name(self):
+        path = self.template("PI_TOR_AP_SUBNET=10.12.195.0/24")
+        res = self.fx.run("up", PI_TOR_AP_SUBNET="10.99.0.0/24",
+                          PI_TOR_AP_GATEWAY="10.99.0.1",
+                          PI_TOR_AP_TEMPLATE=str(path))
+        self.assertNotEqual(res.returncode, 0)
+        self.assertIn("does not match", res.stderr)
+        self.assertIn(str(path), res.stderr)
+        self.assertIn("10.12.195.0/24", res.stderr)
+        self.assertNotIn(PSK, res.stdout + res.stderr,
+                         "the refusal must never print the passphrase")
+        self.assertEqual(self.fx.calls(), [],
+                         "refused before anything was created")
+        self.assertFalse(self.fx.rundir.exists())
+
+    def test_a_template_without_the_key_still_means_the_documented_default(self):
+        # the renderer falls back to the built-in default, so that is what the
+        # live subnet has to match - an absent line is not "nothing to check"
+        path = self.template("PI_TOR_AP_INTERFACE=uap0")
+        res = self.fx.run("up", PI_TOR_AP_SUBNET="10.99.0.0/24",
+                          PI_TOR_AP_GATEWAY="10.99.0.1",
+                          PI_TOR_AP_TEMPLATE=str(path))
+        self.assertNotEqual(res.returncode, 0)
+        self.assertIn("10.12.195.0/24", res.stderr)
+        self.assertEqual(self.fx.calls(), [])
+
+
 class ApPolicyTest(unittest.TestCase):
     """The invariants that must not drift: one Pi-hole listener, no secret in
     the repo, and the unit wired to a root-only env file."""

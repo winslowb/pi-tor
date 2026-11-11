@@ -2,16 +2,19 @@
 once per start and leave no duplicate chains (against a stub iptables, never
 the real one), and a legacy iptables backend is refused with a visible error.
 """
+import json
 import os
+import re
 import shutil
 import tempfile
 import textwrap
 import unittest
 from unittest import mock
 
-from helpers import make_config_tree
+from helpers import REPO, make_config_tree
 
 import apply as apply_mod
+import config_schema as schema
 import dockerops
 import render
 
@@ -74,6 +77,8 @@ STUB6 = textwrap.dedent("""\
     PI_TOR_FAKE_STATE="${PI_TOR_FAKE_STATE6:?PI_TOR_FAKE_STATE6 required}" \
         exec "${PI_TOR_IPTABLES_STUB:?PI_TOR_IPTABLES_STUB required}" "$@"
 """)
+
+PSK = "correct horse battery sentinel"
 
 ENV_KEYS = ("IPTABLES_BIN", "IP6TABLES_BIN", "PI_TOR_FAKE_STATE",
             "PI_TOR_FAKE_STATE6", "PI_TOR_IPTABLES_STUB", "PI_TOR_FAKE_ROOT",
@@ -193,6 +198,49 @@ class StartupApplyTest(unittest.TestCase):
         self._use_stub(version="iptables v1.8.10 (nf_tables)")
         res = apply_mod.startup_rules_apply(self.tree)
         self.assertIn("applied", res, res)
+
+    def test_startup_apply_guards_a_custom_ap_subnet_from_the_template(self):
+        # the non-secret template is the only place the ui may read the guest
+        # net from; the live /etc/default/pi-tor-ap holds the passphrase
+        ap = self.tree / "systemd" / "pi-tor-ap.env.example"
+        ap.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(REPO / "systemd" / "pi-tor-ap.env.example", ap)
+        text = ap.read_text()
+        for key, value in (("PI_TOR_AP_INTERFACE", "wlan9"),
+                           ("PI_TOR_AP_SUBNET", "10.99.0.0/24"),
+                           ("PI_TOR_AP_GATEWAY", "10.99.0.1"),
+                           ("PI_TOR_AP_PSK", PSK)):
+            text = re.sub(rf"(?m)^{key}=.*$", f"{key}={value}", text)
+        ap.write_text(text)
+        # a deployment re-renders torrc from the template (every UI apply
+        # does), so the tree has to be in step with it
+        apply_mod._write_all(self.tree, render.render(schema.defaults(), self.tree))
+
+        self._use_stub()
+        res = apply_mod.startup_rules_apply(self.tree)
+        self.assertIn("applied", res, res)
+        with open(os.path.join(self.state, "filter", "PI_TOR_DNS"),
+                  encoding="utf-8") as f:
+            guard = f.read().splitlines()
+        self.assertEqual(
+            guard,
+            ["-i lo -j ACCEPT",
+             "-i usb0 -s 10.12.194.0/24 -j ACCEPT",
+             "-i wlan9 -s 10.99.0.0/24 -j ACCEPT",
+             "-j DROP"],
+            "the :53 guard still pins the default guest net")
+        # nothing AP-scoped was installed by a plain apply
+        self.assertFalse(os.path.exists(
+            os.path.join(self.state, "nat", "PI_TOR_AP_REDIRECT")))
+        with open(os.path.join(self.state, "filter", "INPUT"),
+                  encoding="utf-8") as f:
+            self.assertNotIn("PI_TOR_AP_IN", f.read())
+        # the passphrase in the template reaches neither the result nor a rule
+        self.assertNotIn(PSK, json.dumps(res))
+        for root, _dirs, files in os.walk(self.state):
+            for name in files:
+                with open(os.path.join(root, name), encoding="utf-8") as f:
+                    self.assertNotIn(PSK, f.read(), name)
 
     def test_dry_run_skips_startup_apply(self):
         os.environ["PI_TOR_UI_DRY_RUN"] = "1"

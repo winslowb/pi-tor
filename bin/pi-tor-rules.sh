@@ -42,7 +42,10 @@ PIHOLE_PORT="${PI_TOR_PIHOLE_PORT:-53}"
 # the other's DNS policy, and the guest allow also covers the DNAT'ed query
 # whose destination is the tether address.
 DNS_CHAIN="${PI_TOR_DNS_CHAIN:-PI_TOR_DNS}"
-AP_GUARD_INTERFACE="${PI_TOR_AP_INTERFACE:-uap0}"
+# The guest interface the guard accepts on, separate from AP_INTERFACE:
+# `apply` from the ui container knows it (from the AP env template) but
+# must not set PI_TOR_AP_INTERFACE, which also switches AP mode on.
+AP_GUARD_INTERFACE="${PI_TOR_AP_GUARD_INTERFACE:-${PI_TOR_AP_INTERFACE:-uap0}}"
 
 # Protected hosts: IPv4 addresses traffic to which must never be diverted
 # into tor (SSH :22, Pi-hole :80 and the config UI :8080 live on this host).
@@ -110,9 +113,11 @@ dns_guard_rules() {
   # ACCEPTs and nothing wider. Loopback is the Pi itself (and Pi-hole's own
   # health probes); the tether and guest nets are the two interfaces that may
   # resolve. Everything else - the uplink/LAN above all - falls to the DROP.
-  # The AP pair falls back to bin/pi-tor-ap's defaults because `apply` (the ui
-  # container) has no AP env: a customised guest subnet must be given to this
-  # script too, or guests lose DNS - closed, never open.
+  # The AP pair is given to every ui-side call from the non-secret AP env
+  # template (PI_TOR_AP_GUARD_INTERFACE/PI_TOR_AP_SUBNET, see dockerops), and
+  # by the AP unit for its own apply-ap. Missing values fall back to
+  # bin/pi-tor-ap's defaults: a customised guest net must reach this script
+  # too, or guests lose DNS - closed, never open.
   printf '%s\n' "-i lo -j ACCEPT"
   printf '%s\n' "-i $INTERFACE -s $SUBNET -j ACCEPT"
   printf '%s\n' "-i $AP_GUARD_INTERFACE -s $AP_SUBNET -j ACCEPT"
@@ -171,7 +176,7 @@ dns_guard6_apply() {
 
 show_dns_guard() {
   local ipt="${IPTABLES_BIN:-iptables}" proto rule
-  echo "# DNS guard (${DNS_CHAIN}): FTL listens on every interface, so only loopback, ${INTERFACE} and ${AP_GUARD_INTERFACE} may reach :${PIHOLE_PORT} (the AP interface by default; inert while the AP is down)"
+  echo "# DNS guard (${DNS_CHAIN}): FTL listens on every interface, so only loopback, ${INTERFACE} and ${AP_GUARD_INTERFACE} may reach :${PIHOLE_PORT} (the guest interface: the AP env template, or uap0; inert while the AP is down)"
   for proto in udp tcp; do
     printf '%s\n' "$ipt -t filter -I INPUT 1 -p $proto --dport $PIHOLE_PORT -j $DNS_CHAIN"
   done

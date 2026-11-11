@@ -808,7 +808,9 @@ the config UI reads: it renders tor's `SocksPolicy accept <guest net>` from
 0600 one, so a UI config save keeps the guest accept in step with what
 `bin/pi-tor-ap` runs. Customise the subnet in the template, then reinstall it
 and re-enter the SSID/passphrase — editing only the live copy leaves tor
-denying the guest net (TCP closed before any data, DNS `REFUSED`).
+denying the guest net (TCP closed before any data, DNS `REFUSED`), and
+`bin/pi-tor-ap up`/`plan` now refuses that drift outright: the message names
+both paths and the two subnets, and never prints the passphrase.
 
 Host packages: `hostapd`, `dnsmasq` and `iw` on Armbian. The distro units must
 not run alongside the AP — `dnsmasq.service` would take `:53` away from
@@ -853,15 +855,19 @@ What guests get:
   `PI_TOR_DNS` chain is what confines `:53` to loopback, the tether net and the
   guest net — the guest net is in that chain precisely so a query that arrives
   on `uap0` and is addressed to the tether address is allowed. Nothing is
-  served on the uplink. The AP subnet is rendered into tor's `SocksPolicy`
-  from `PI_TOR_AP_SUBNET` in `systemd/pi-tor-ap.env.example` (the non-secret
-  template; the live `/etc/default/pi-tor-ap` is never read by the UI), so
-  that file is where a customised guest net has to be set. A customised
-  `PI_TOR_AP_INTERFACE`/`PI_TOR_AP_SUBNET` must also be given to
-  `bin/pi-tor-rules.sh` for the `:53` guard (the AP unit exports them for its
-  own `apply-ap`, but the ui container's `apply` only knows the schema
-  defaults): otherwise guests lose DNS rather than gain an unfiltered
-  resolver.
+  served on the uplink. The guest subnet and interface are rendered into
+  tor's `SocksPolicy` and handed to the `:53` guard from
+  `PI_TOR_AP_SUBNET`/`PI_TOR_AP_INTERFACE` in
+  `systemd/pi-tor-ap.env.example` (the non-secret template; the live
+  `/etc/default/pi-tor-ap` is never read by the UI), so that file is where a
+  customised guest net has to be set. Every UI-side rules run — the startup
+  apply, a config apply and a rollback — passes the template's subnet as
+  `PI_TOR_AP_SUBNET` and its interface as `PI_TOR_AP_GUARD_INTERFACE` to
+  `bin/pi-tor-rules.sh`; the second name is what puts the guard on the guest
+  link without `PI_TOR_AP_INTERFACE`, which would also install the AP chains.
+  `bin/pi-tor-ap up` refuses when the live file's interface/subnet is not the
+  template's, so the two cannot drift apart silently: guests would otherwise
+  lose DNS rather than gain an unfiltered resolver.
 - **TCP only through tor.** All guest TCP is DNAT'ed to
   `PI_TOR_GATEWAY:PI_TOR_TRANS_PORT`, i.e. into tor's TransPort. DNAT rather
   than REDIRECT on purpose: a REDIRECT would land on the AP interface's own

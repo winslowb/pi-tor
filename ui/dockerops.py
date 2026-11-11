@@ -18,6 +18,8 @@ import struct
 import subprocess
 import time
 
+import render
+
 SOCKET_PATH = os.environ.get("PI_TOR_DOCKER_SOCKET", "/var/run/docker.sock")
 
 # Test-visible proof of privileged activity in non-dry mode.
@@ -210,7 +212,10 @@ RULES_ENV_KEYS = {
 
 
 def rules_env(values):
-    """The explicit PI_TOR_* env passed to bin/pi-tor-rules.sh."""
+    """The schema half of the PI_TOR_* env passed to bin/pi-tor-rules.sh.
+
+    The guest net/interface are added by run_rules from the AP env template.
+    """
     return {k: values[key] for k, key in RULES_ENV_KEYS.items()}
 
 
@@ -234,6 +239,10 @@ def run_rules(root, values, action="apply"):
         return {"error": f"{script} not found (project not mounted?)"}
     env = dict(os.environ)
     env.update(rules_env(values))
+    # The :53 guard's guest net comes from the non-secret AP template: without
+    # it the guard pins the default subnet and a customised guest loses DNS.
+    # PI_TOR_AP_INTERFACE stays unset - it would also install the AP chains.
+    env.update(render.ap_guard_env(root))
     counters["subprocess_calls"] += 1
     try:
         p = subprocess.run([script, action], env=env,

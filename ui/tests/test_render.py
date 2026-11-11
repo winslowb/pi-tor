@@ -1,5 +1,6 @@
 """Render/parse round-trip tests against the committed defaults."""
 import json
+import os
 import re
 import shutil
 import subprocess
@@ -7,6 +8,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from helpers import REPO, make_config_tree
 
@@ -304,6 +306,34 @@ class ApSubnetSourceOfTruthTest(unittest.TestCase):
             self.assertNotIn(self.PSK.encode(), data, f"{rel} leaks the PSK")
         self.assertNotIn(self.PSK, json.dumps(render.read_current(self.tree)))
         self.assertNotIn("systemd/pi-tor-ap.env.example", render.RENDER_TARGETS)
+
+    def test_the_rules_env_the_ui_applies_carries_the_template_guest_net(self):
+        # startup apply, config apply and rollback all reach the script through
+        # dockerops.run_rules: without the template guest net the :53 guard
+        # pins the default subnet and a customised guest loses DNS
+        self._customise(guest=self.GUEST, psk=self.PSK)
+        # a deployment re-renders torrc from the template (every UI apply
+        # does), so the tree has to be in step with it
+        import apply as apply_mod
+        apply_mod._write_all(self.tree, render.render(schema.defaults(), self.tree))
+        saved = os.environ.pop("PI_TOR_AP_INTERFACE", None)
+        if saved is not None:
+            self.addCleanup(os.environ.__setitem__, "PI_TOR_AP_INTERFACE", saved)
+        values = render.read_current(self.tree)["values"]
+        with mock.patch.object(dockerops, "iptables_backend",
+                               return_value={"backend": "nf_tables"}), \
+             mock.patch.object(dockerops.subprocess, "run") as run:
+            run.return_value = mock.Mock(returncode=0, stdout="", stderr="")
+            res = dockerops.run_rules(self.tree, values)
+        self.assertIn("applied", res, res)
+        env = run.call_args.kwargs["env"]
+        self.assertEqual(env["PI_TOR_AP_SUBNET"], self.GUEST)
+        # the interface travels as its own variable: PI_TOR_AP_INTERFACE also
+        # switches on the AP chains, which a plain ui apply must not install
+        self.assertEqual(env["PI_TOR_AP_GUARD_INTERFACE"], "uap0")
+        self.assertNotIn("PI_TOR_AP_INTERFACE", env)
+        self.assertEqual(env["PI_TOR_SUBNET"], schema.DEFAULTS["subnet"])
+        self.assertNotIn(self.PSK, json.dumps(env))
 
     def test_an_unparsable_guest_subnet_falls_back_to_the_default(self):
         # tor refuses the whole torrc for a bad SocksPolicy line, and the AP

@@ -69,8 +69,9 @@ SocksPolicy accept {cfg['subnet']}
 # to the TransPort first). It is here because this ACL is the gate on every
 # entry listener. The value is PI_TOR_AP_SUBNET from
 # systemd/pi-tor-ap.env.example, the non-secret template the live
-# /etc/default/pi-tor-ap is installed from: a customised guest net must be set
-# there and reinstalled, or this accept drifts from bin/pi-tor-ap.
+# /etc/default/pi-tor-ap is installed from. The config UI reads the same
+# template for this accept and for the :53 guard, and bin/pi-tor-ap refuses to
+# start when the live file's subnet differs from it.
 SocksPolicy accept {ap}
 SocksPolicy reject *
 
@@ -189,6 +190,21 @@ def ap_subnet(root):
         return str(ipaddress.IPv4Network(value, strict=False))
     except ValueError:
         return AP_SUBNET
+
+
+def ap_guard_env(root):
+    """The expert PI_TOR_* pair the :53 guard needs for the guest net.
+
+    Read from the non-secret template like ap_subnet - the live
+    /etc/default/pi-tor-ap holds the passphrase and is never read here. The
+    interface has its own PI_TOR_AP_GUARD_INTERFACE name because
+    PI_TOR_AP_INTERFACE also switches the AP chains on in bin/pi-tor-rules.sh,
+    and a ui apply must only install the tether rules plus the guard.
+    """
+    env = _envdict(_read(root, AP_ENV))
+    return {"PI_TOR_AP_GUARD_INTERFACE":
+                env.get("PI_TOR_AP_INTERFACE") or "uap0",
+            "PI_TOR_AP_SUBNET": ap_subnet(root)}
 
 
 _TORRC_RES = [
