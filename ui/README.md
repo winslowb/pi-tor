@@ -71,10 +71,15 @@ the gadget interface:
   path. A nat `PREROUTING` REDIRECT rewrites the destination to the incoming
   interface's own primary address (not loopback; locally-generated packets
   are the ones mapped to 127.0.0.1), so these binds require the gadget
-  address. They **must never go wildcard**: neither listener has a source
-  ACL, so a wildcard would expose an unauthenticated transparent proxy and
-  an open resolver on the Pi's other interfaces (e.g. Wi-Fi). `DNSPort` also
-  binds `127.0.0.1` because Pi-hole's upstream
+  address. They **must never go wildcard**: `SocksPolicy` is the entry ACL for
+  *every* entry listener — tor checks it before it looks at which listener
+  accepted, so `TransPort` and `DNSPort` are covered too, not just SOCKS — and
+  it admits only loopback, the tether net and the AP guest net. A wildcard
+  would still expose an unauthenticated transparent proxy and an open resolver
+  on the Pi's other interfaces (e.g. Wi-Fi). The guest net is listed because
+  the AP DNATs guest TCP to the `TransPort`; guests never reach the SOCKS
+  listener, since that same chain rewrites all their TCP to the `TransPort`
+  first. `DNSPort` also binds `127.0.0.1` because Pi-hole's upstream
   (`FTLCONF_dns_upstreams`) is `127.0.0.1#<dns>`.
 
 `bin/uplink-check.sh` covers the start-ordering gap: after the uplink gate

@@ -152,10 +152,24 @@ class TorrcBindTest(unittest.TestCase):
         print("rendered SocksPolicy block:", block, file=sys.stderr)
         self.assertEqual(block, ["accept 127.0.0.1",
                                  f"accept {schema.DEFAULTS['subnet']}",
+                                 "accept 10.12.195.0/24",
                                  "reject *"])
         # first-match-wins ACL: the terminator must be last, after the
         # loopback and subnet accepts, or non-listed sources would be
         # accepted by tor's default
+        self.assertEqual(block[-1], "reject *")
+
+    # bin/pi-tor-ap's PI_TOR_AP_SUBNET default. The AP nat chain DNATs guest
+    # TCP to the TransPort, and tor runs this same source ACL on every entry
+    # listener, TransPort included (connection_handle_listener_read checks
+    # new_type == CONN_TYPE_AP before it looks at the listener). Unlisted, a
+    # guest connection is accepted and closed before it can send a byte.
+    AP_SUBNET = "10.12.195.0/24"
+
+    def test_guest_subnet_may_enter_tor(self):
+        block = _policies(self.torrc)
+        self.assertIn(f"accept {self.AP_SUBNET}", block[:-1],
+                      f"SocksPolicy would deny the AP guest net: {block}")
         self.assertEqual(block[-1], "reject *")
 
     def test_rendered_torrc_has_no_wildcard_trans_or_dns_port(self):

@@ -12,6 +12,14 @@ from pathlib import Path
 
 import config_schema as schema
 
+# bin/pi-tor-ap's PI_TOR_AP_SUBNET default. The AP nat chain DNATs guest TCP
+# to the TransPort, and tor runs SocksPolicy on every entry listener, the
+# transparent one included (connection_handle_listener_read checks
+# new_type == CONN_TYPE_AP before it looks at the listener), so the guest net
+# must be listed there or every guest connection is accepted and closed before
+# it can send a byte. read_current() skips it: it is not the tether subnet.
+AP_SUBNET = "10.12.195.0/24"
+
 
 def render(cfg):
     """Render every config target from a full validated value dict."""
@@ -38,11 +46,18 @@ AvoidDiskWrites 1
 SocksPort 0.0.0.0:{cfg['socks_port']}
 SocksPolicy accept 127.0.0.1
 SocksPolicy accept {cfg['subnet']}
+# The AP guest net is listed for the TransPort, not for SOCKS: guests cannot
+# even reach the SOCKS listener (the AP chain DNATs all their TCP to the
+# TransPort first). It is here because this ACL is the gate on every entry
+# listener. A customised guest subnet must be added here too or guests lose
+# TCP egress (closed, never open).
+SocksPolicy accept {AP_SUBNET}
 SocksPolicy reject *
 
 # Transparent proxy: a nat PREROUTING REDIRECT rewrites the destination to
 # the incoming interface's own address (not loopback), so this must keep the
-# gadget-address bind and must never become a wildcard - TransPort has no ACL
+# gadget-address bind and must never become a wildcard - it has no ACL of its
+# own, only the shared SocksPolicy above
 TransPort {cfg['gateway_ip']}:{cfg['trans_port']}
 
 # DNS: loopback serves the local dnsmasq upstream; the gadget address serves
@@ -190,7 +205,7 @@ def read_current(root):
                 if m:
                     set_from(key, "tor/torrc", m.group(2))
             m = _POLICY_ACCEPT_RE.match(line)
-            if m and m.group(1) != "127.0.0.1" and m.group(1) != "*":
+            if m and m.group(1) not in ("127.0.0.1", "*", AP_SUBNET):
                 set_from("subnet", "tor/torrc", m.group(1))
             m = _VIRTUAL_RE.match(line)
             if m:

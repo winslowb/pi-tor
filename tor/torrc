@@ -10,11 +10,18 @@ AvoidDiskWrites 1
 SocksPort 0.0.0.0:9050
 SocksPolicy accept 127.0.0.1
 SocksPolicy accept 10.12.194.0/24
+# The AP guest net is listed for the TransPort, not for SOCKS: guests cannot
+# even reach the SOCKS listener (the AP chain DNATs all their TCP to the
+# TransPort first). It is here because this ACL is the gate on every entry
+# listener. A customised guest subnet must be added here too or guests lose
+# TCP egress (closed, never open).
+SocksPolicy accept 10.12.195.0/24
 SocksPolicy reject *
 
 # Transparent proxy: a nat PREROUTING REDIRECT rewrites the destination to
 # the incoming interface's own address (not loopback), so this must keep the
-# gadget-address bind and must never become a wildcard - TransPort has no ACL
+# gadget-address bind and must never become a wildcard - it has no ACL of its
+# own, only the shared SocksPolicy above
 TransPort 10.12.194.1:9040
 
 # DNS: loopback serves the local dnsmasq upstream; the gadget address serves
