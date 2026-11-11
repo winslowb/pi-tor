@@ -10,22 +10,30 @@ AvoidDiskWrites 1
 SocksPort 0.0.0.0:9050
 SocksPolicy accept 127.0.0.1
 SocksPolicy accept 10.12.194.0/24
-# The AP guest net is listed for the TransPort, not for SOCKS: guests cannot
-# even reach the SOCKS listener (the AP chain DNATs all their TCP to the
-# TransPort first). It is here because this ACL is the gate on every entry
-# listener. A customised guest subnet must be added here too or guests lose
-# TCP egress (closed, never open).
+# The AP guest net is listed for the TransPort and the DNSPort, not for SOCKS:
+# guests cannot even reach the SOCKS listener (the AP chain DNATs all their TCP
+# to the TransPort first). It is here because this ACL is the gate on every
+# entry listener. The value is PI_TOR_AP_SUBNET from
+# systemd/pi-tor-ap.env.example, the non-secret template the live
+# /etc/default/pi-tor-ap is installed from: a customised guest net must be set
+# there and reinstalled, or this accept drifts from bin/pi-tor-ap.
 SocksPolicy accept 10.12.195.0/24
 SocksPolicy reject *
 
 # Transparent proxy: a nat PREROUTING REDIRECT rewrites the destination to
 # the incoming interface's own address (not loopback), so this must keep the
-# gadget-address bind and must never become a wildcard - it has no ACL of its
-# own, only the shared SocksPolicy above
+# gadget-address bind and must never become a wildcard. It has no ACL of its
+# own: the shared SocksPolicy above is the gate on this listener's AP path,
+# where an unlisted source is accepted and then closed before it can send a
+# byte (no reply, no refusal)
 TransPort 10.12.194.1:9040
 
 # DNS: loopback serves the local dnsmasq upstream; the gadget address serves
-# DNS redirected off the gadget interface. Same no-wildcard rule as TransPort
+# DNS redirected off the gadget interface. Same no-wildcard rule as TransPort,
+# different policy path: every DNSPort request is checked against the same
+# SocksPolicy and answered REFUSED when its source is not listed (tor's
+# dnsserv.c), so an unlisted guest net gets an empty answer, not a closed
+# socket
 DNSPort 127.0.0.1:5353
 DNSPort 10.12.194.1:5353
 

@@ -47,7 +47,7 @@ def apply_changes(root, posted, dry=None):
     if errors:
         return {"ok": False, "errors": errors}
 
-    rendered = render.render(cfg)
+    rendered = render.render(cfg, root)
     changed = render.changed_files(root, cfg)
     before_values = current["values"]
 

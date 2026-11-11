@@ -61,26 +61,51 @@ the gadget interface:
 - `SocksPort 0.0.0.0:<socks>` — the only wildcard bind. It exists so tor can
   bind before `usb0` is addressed (the healthcheck and the workstation both
   go through it), and it is safe only because `SocksPolicy` below it is a
-  source ACL tor enforces per connection (`accept 127.0.0.1`, `accept
-  <subnet>`, `reject *` last — non-listed sources are accepted by default, so
-  the terminator must stay last). A second explicit-loopback `SocksPort` on
-  the same port cannot co-exist with the wildcard listener: the kernel
-  refuses with EADDRINUSE in either bind order (verified against tor
-  0.4.9).
+  source ACL tor enforces per connection (`accept 127.0.0.1`, the tether
+  net, the AP guest net, then `reject *` — non-listed sources are accepted by
+  default, so the terminator must stay last). A second explicit-loopback
+  `SocksPort` on the same port cannot co-exist with the wildcard listener:
+  the kernel refuses with EADDRINUSE in either bind order (verified against
+  tor 0.4.9).
 - `TransPort <gateway>:<port>` and `DNSPort <gateway>:<port>` — the service
   path. A nat `PREROUTING` REDIRECT rewrites the destination to the incoming
   interface's own primary address (not loopback; locally-generated packets
   are the ones mapped to 127.0.0.1), so these binds require the gadget
-  address. They **must never go wildcard**: `SocksPolicy` is the entry ACL for
-  *every* entry listener — tor checks it before it looks at which listener
-  accepted, so `TransPort` and `DNSPort` are covered too, not just SOCKS — and
-  it admits only loopback, the tether net and the AP guest net. A wildcard
-  would still expose an unauthenticated transparent proxy and an open resolver
-  on the Pi's other interfaces (e.g. Wi-Fi). The guest net is listed because
-  the AP DNATs guest TCP to the `TransPort`; guests never reach the SOCKS
-  listener, since that same chain rewrites all their TCP to the `TransPort`
-  first. `DNSPort` also binds `127.0.0.1` because Pi-hole's upstream
+  address. They **must never go wildcard**: the same `SocksPolicy` admits
+  only loopback, the tether net and the AP guest net, and a wildcard would
+  expose an unauthenticated transparent proxy and an open resolver on the
+  Pi's other interfaces (e.g. Wi-Fi). The two listeners reach that policy by
+  different paths, and the difference is visible from a client:
+  - `TransPort` goes through the SocksPolicy gate on the AP-listener path:
+    tor checks the source address when the connection is accepted, before
+    it looks at which listener took it. A connection from an unlisted source
+    is accepted and then closed before any application data — `curl` reports
+    a TLS `unexpected EOF`, tor logs `Denying socks connection from
+    untrusted address`. There is no refusal to read.
+  - `DNSPort` checks the same policy per request (tor's `dnsserv.c`) and
+    answers `REFUSED` when the source is not listed, so an unlisted guest
+    net gets an empty answer rather than a dropped or closed socket.
+
+  The guest net is listed because the AP DNATs guest TCP to the `TransPort`
+  and guest DNS to Pi-hole; guests never reach the SOCKS listener, since
+  that same chain rewrites all their TCP to the `TransPort` first.
+  `DNSPort` also binds `127.0.0.1` because Pi-hole's upstream
   (`FTLCONF_dns_upstreams`) is `127.0.0.1#<dns>`.
+
+### The AP guest net is read, never guessed
+
+The guest accept is rendered from `PI_TOR_AP_SUBNET` in
+`systemd/pi-tor-ap.env.example` — the committed, non-secret template the live
+`/etc/default/pi-tor-ap` is installed from, and the only file either side can
+share: the live file is mode 0600 because it also holds the Wi-Fi passphrase,
+and neither this container nor the renderer reads, mounts or exposes it. Every
+render reads the template, so a UI config save keeps the guest accept in step
+with what `bin/pi-tor-ap` runs instead of dropping it back to the default
+`10.12.195.0/24`; a customised subnet is set in the template and the live file
+reinstalled from it. The interface/subnet also have to reach
+`bin/pi-tor-rules.sh` for the `:53` guard (see the AP section of the
+top-level README). A template value tor cannot parse is ignored in favour of
+the default: tor refuses the whole torrc over one bad `SocksPolicy` line.
 
 `bin/uplink-check.sh` covers the start-ordering gap: after the uplink gate
 passes it waits up to 30 s (one log line per second) until every gadget

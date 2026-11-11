@@ -1,4 +1,5 @@
 """Render/parse round-trip tests against the committed defaults."""
+import json
 import re
 import shutil
 import subprocess
@@ -111,9 +112,12 @@ class TorrcBindTest(unittest.TestCase):
     dnsmasq upstream plus the gadget-address listener for queries redirected
     off the gadget interface. Trans/DNS keep the gadget-address binds because
     a nat PREROUTING REDIRECT rewrites the destination to the incoming
-    interface's own address, and those listeners have no source ACL, so they
-    must never go wildcard. Loopback service (healthcheck, dnsmasq) never
-    depends on the gadget interface being addressed.
+    interface's own address, and the same SocksPolicy gate covers every entry
+    listener too — a TransPort connection from an unlisted source is accepted
+    and closed before any application data, a DNSPort request is answered
+    REFUSED — so the wildcard ban is about the bind, not a missing ACL.
+    Loopback service (healthcheck, dnsmasq) never depends on the gadget
+    interface being addressed.
     """
 
     def setUp(self):
@@ -175,8 +179,9 @@ class TorrcBindTest(unittest.TestCase):
     def test_rendered_torrc_has_no_wildcard_trans_or_dns_port(self):
         # REDIRECT's destination is the incoming interface's primary address
         # (iptables-extensions(8), nf_nat_redirect_ipv4), so Trans/DNS keep
-        # the gadget-address bind; with no source ACL on those listeners the
-        # safety rule is a hard wildcard ban instead.
+        # the gadget-address bind; the shared SocksPolicy above covers both
+        # listeners (TransPort accept-then-close, DNSPort REFUSED), so the
+        # safety rule here is a hard wildcard ban on the bind itself.
         for kind, addr, port in _binds(self.torrc):
             if kind == "SocksPort":
                 continue
@@ -218,6 +223,98 @@ class ExitNodesTest(unittest.TestCase):
                              (REPO / "tor/torrc").read_bytes())
         finally:
             shutil.rmtree(tree, ignore_errors=True)
+
+
+class ApSubnetSourceOfTruthTest(unittest.TestCase):
+    """The guest net tor admits must be the one bin/pi-tor-ap will run.
+
+    /etc/default/pi-tor-ap is mode 0600 because it holds the passphrase, so
+    the renderer reads the non-secret template that file is installed from:
+    systemd/pi-tor-ap.env.example. Every render reads it, so a UI config save
+    re-renders torrc from the same value instead of dropping a customised
+    guest net back to the hard-coded default.
+    """
+
+    GUEST = "10.99.0.0/24"
+    PSK = "sentinel-psk-value"
+
+    def setUp(self):
+        self.tree = make_config_tree()
+        self.addCleanup(shutil.rmtree, self.tree, True)
+        self.ap_env = self.tree / "systemd" / "pi-tor-ap.env.example"
+        self.ap_env.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(REPO / "systemd/pi-tor-ap.env.example", self.ap_env)
+
+    def _customise(self, guest=None, psk=None):
+        text = self.ap_env.read_text()
+        for key, value in (("PI_TOR_AP_SUBNET", guest),
+                           ("PI_TOR_AP_PSK", psk)):
+            if value is None:
+                continue
+            text = re.sub(rf"(?m)^{key}=.*$", f"{key}={value}", text)
+        self.ap_env.write_text(text)
+
+    def _cfg(self, **over):
+        cfg = dict(schema.defaults())
+        cfg.update(over)
+        self.assertEqual(schema.validate(cfg), [])
+        return cfg
+
+    def test_a_custom_guest_subnet_reaches_the_rendered_torrc(self):
+        self._customise(guest=self.GUEST)
+        torrc = render.render(schema.defaults(), self.tree)["tor/torrc"].decode()
+        block = _policies(torrc)
+        self.assertIn(f"accept {self.GUEST}", block,
+                      f"a customised AP subnet never reaches tor: {block}")
+        self.assertEqual(block.count(f"accept {self.GUEST}"), 1)
+        # first-match-wins ACL: the terminator must still come last
+        self.assertEqual(block[-1], "reject *")
+
+    def test_a_ui_save_keeps_the_custom_guest_subnet(self):
+        # /api/apply re-renders every target from the parsed config; the guest
+        # accept must not fall back to the built-in default on that path
+        self._customise(guest=self.GUEST)
+        import apply as apply_mod
+        cfg = self._cfg(subnet="10.44.0.0/24", gateway_ip="10.44.0.1",
+                        protected_hosts="10.44.0.1")
+        apply_mod._write_all(self.tree, render.render(cfg, self.tree))
+        torrc = (self.tree / "tor/torrc").read_text()
+        self.assertIn(f"SocksPolicy accept {self.GUEST}", torrc)
+        self.assertIn("SocksPolicy accept 10.44.0.0/24", torrc)
+        self.assertEqual(_policies(torrc)[-1], "reject *")
+
+    def test_the_guest_subnet_is_not_read_back_as_the_tether_subnet(self):
+        self._customise(guest=self.GUEST)
+        import apply as apply_mod
+        apply_mod._write_all(self.tree,
+                             render.render(schema.defaults(), self.tree))
+        self.assertEqual(render.read_current(self.tree)["values"]["subnet"],
+                         schema.DEFAULTS["subnet"])
+        # a genuinely changed tether subnet is still parsed from torrc
+        apply_mod._write_all(self.tree, render.render(
+            self._cfg(subnet="10.44.0.0/24", gateway_ip="10.44.0.1",
+                      protected_hosts="10.44.0.1"), self.tree))
+        self.assertEqual(render.read_current(self.tree)["values"]["subnet"],
+                         "10.44.0.0/24")
+
+    def test_the_passphrase_never_reaches_a_render_or_a_read_back_config(self):
+        self._customise(guest=self.GUEST, psk=self.PSK)
+        rendered = render.render(schema.defaults(), self.tree)
+        for rel, data in rendered.items():
+            self.assertNotIn(self.PSK.encode(), data, f"{rel} leaks the PSK")
+        self.assertNotIn(self.PSK, json.dumps(render.read_current(self.tree)))
+        self.assertNotIn("systemd/pi-tor-ap.env.example", render.RENDER_TARGETS)
+
+    def test_an_unparsable_guest_subnet_falls_back_to_the_default(self):
+        # tor refuses the whole torrc for a bad SocksPolicy line, and the AP
+        # refuses to start for a bad subnet anyway: keep tor up
+        self._customise(guest="10.99.0.0/33")
+        block = _policies(
+            render.render(schema.defaults(), self.tree)["tor/torrc"].decode())
+        self.assertEqual(block, ["accept 127.0.0.1",
+                                 f"accept {schema.DEFAULTS['subnet']}",
+                                 f"accept {render.AP_SUBNET}",
+                                 "reject *"])
 
 
 if __name__ == "__main__":

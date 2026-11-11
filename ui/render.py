@@ -7,23 +7,41 @@ Pi-hole's DNS policy is no longer rendered into dnsmasq snippets: v6 ignores
 in `docker-compose.yml` as `FTLCONF_*` substitutions from this `.env`.
 """
 import difflib
+import ipaddress
 import re
 from pathlib import Path
 
 import config_schema as schema
 
-# bin/pi-tor-ap's PI_TOR_AP_SUBNET default. The AP nat chain DNATs guest TCP
-# to the TransPort, and tor runs SocksPolicy on every entry listener, the
-# transparent one included (connection_handle_listener_read checks
-# new_type == CONN_TYPE_AP before it looks at the listener), so the guest net
-# must be listed there or every guest connection is accepted and closed before
-# it can send a byte. read_current() skips it: it is not the tether subnet.
+# The AP nat chain DNATs guest TCP to the TransPort, and tor runs SocksPolicy
+# on every entry listener, the transparent one included
+# (connection_handle_listener_read checks new_type == CONN_TYPE_AP before it
+# looks at the listener), so the guest net must be listed there or every guest
+# connection is accepted and closed before it can send a byte; on the DNSPort
+# the same check answers REFUSED per request. read_current() skips the guest
+# accept: it is not the tether subnet.
+#
+# The guest net is read from the non-secret AP env template, never from the
+# live /etc/default/pi-tor-ap (0600, it also holds the passphrase): that
+# template is what the live file is installed from, so a customised
+# PI_TOR_AP_SUBNET belongs there, and every render picks it up - a UI config
+# save cannot silently drop it back to this default. AP_SUBNET is the same
+# default bin/pi-tor-ap falls back to, used when the template is absent or
+# unparsable.
 AP_SUBNET = "10.12.195.0/24"
+AP_ENV = "systemd/pi-tor-ap.env.example"
 
 
-def render(cfg):
-    """Render every config target from a full validated value dict."""
+def render(cfg, root=None):
+    """Render every config target from a full validated value dict.
+
+    root is the config tree; the AP env template is read from it for the
+    guest accept, defaulting to this checkout.
+    """
     cfg = schema.normalize_all(cfg)
+    if root is None:
+        root = Path(__file__).resolve().parent.parent
+    ap = ap_subnet(root)
 
     if cfg["exit_nodes_exclude"]:
         exclude_line = f"ExcludeExitNodes {cfg['exit_nodes_exclude']}"
@@ -46,22 +64,30 @@ AvoidDiskWrites 1
 SocksPort 0.0.0.0:{cfg['socks_port']}
 SocksPolicy accept 127.0.0.1
 SocksPolicy accept {cfg['subnet']}
-# The AP guest net is listed for the TransPort, not for SOCKS: guests cannot
-# even reach the SOCKS listener (the AP chain DNATs all their TCP to the
-# TransPort first). It is here because this ACL is the gate on every entry
-# listener. A customised guest subnet must be added here too or guests lose
-# TCP egress (closed, never open).
-SocksPolicy accept {AP_SUBNET}
+# The AP guest net is listed for the TransPort and the DNSPort, not for SOCKS:
+# guests cannot even reach the SOCKS listener (the AP chain DNATs all their TCP
+# to the TransPort first). It is here because this ACL is the gate on every
+# entry listener. The value is PI_TOR_AP_SUBNET from
+# systemd/pi-tor-ap.env.example, the non-secret template the live
+# /etc/default/pi-tor-ap is installed from: a customised guest net must be set
+# there and reinstalled, or this accept drifts from bin/pi-tor-ap.
+SocksPolicy accept {ap}
 SocksPolicy reject *
 
 # Transparent proxy: a nat PREROUTING REDIRECT rewrites the destination to
 # the incoming interface's own address (not loopback), so this must keep the
-# gadget-address bind and must never become a wildcard - it has no ACL of its
-# own, only the shared SocksPolicy above
+# gadget-address bind and must never become a wildcard. It has no ACL of its
+# own: the shared SocksPolicy above is the gate on this listener's AP path,
+# where an unlisted source is accepted and then closed before it can send a
+# byte (no reply, no refusal)
 TransPort {cfg['gateway_ip']}:{cfg['trans_port']}
 
 # DNS: loopback serves the local dnsmasq upstream; the gadget address serves
-# DNS redirected off the gadget interface. Same no-wildcard rule as TransPort
+# DNS redirected off the gadget interface. Same no-wildcard rule as TransPort,
+# different policy path: every DNSPort request is checked against the same
+# SocksPolicy and answered REFUSED when its source is not listed (tor's
+# dnsserv.c), so an unlisted guest net gets an empty answer, not a closed
+# socket
 DNSPort 127.0.0.1:{cfg['dns_port']}
 DNSPort {cfg['gateway_ip']}:{cfg['dns_port']}
 
@@ -152,6 +178,19 @@ def _envdict(text):
     return out
 
 
+def ap_subnet(root):
+    """The AP guest net from the AP env template, or AP_SUBNET.
+
+    A value tor would refuse to parse is ignored: the AP refuses to start on
+    it anyway, and a bad line in torrc would take the whole tor down.
+    """
+    value = _envdict(_read(root, AP_ENV)).get("PI_TOR_AP_SUBNET", "")
+    try:
+        return str(ipaddress.IPv4Network(value, strict=False))
+    except ValueError:
+        return AP_SUBNET
+
+
 _TORRC_RES = [
     # (regex, key) — first two groups are host and port
     (re.compile(r"^SocksPort\s+(\S+?):(\d+)\s*$"), "socks_port"),
@@ -195,6 +234,7 @@ def read_current(root):
         values[key] = value
         sources[key] = rel
 
+    ap = ap_subnet(root)
     if torrc:
         for line in torrc.splitlines():
             m = _GW_BIND_RE.match(line)
@@ -205,7 +245,7 @@ def read_current(root):
                 if m:
                     set_from(key, "tor/torrc", m.group(2))
             m = _POLICY_ACCEPT_RE.match(line)
-            if m and m.group(1) not in ("127.0.0.1", "*", AP_SUBNET):
+            if m and m.group(1) not in ("127.0.0.1", "*", ap):
                 set_from("subnet", "tor/torrc", m.group(1))
             m = _VIRTUAL_RE.match(line)
             if m:
@@ -275,7 +315,7 @@ def read_current(root):
 
 def diff_all(root, cfg):
     """Unified diff per target between on-disk bytes and the new render."""
-    rendered = render(cfg)
+    rendered = render(cfg, root)
     diffs = {}
     for rel, new_bytes in rendered.items():
         old_text = _read(root, rel) or ""
@@ -290,7 +330,7 @@ def diff_all(root, cfg):
 
 
 def changed_files(root, cfg):
-    rendered = render(cfg)
+    rendered = render(cfg, root)
     changed = []
     for rel, new_bytes in rendered.items():
         p = Path(root) / rel

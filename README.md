@@ -799,6 +799,17 @@ internal one such as `PI_TOR_RULES`) is ignored and logged, so a manual run
 never needs the passphrase on the command line where `ps` would show it. Values already in the environment
 win, which is what the unit's `EnvironmentFile` supplies.
 
+**Source of truth for the AP addressing.** `systemd/pi-tor-ap.env.example` is
+where `PI_TOR_AP_INTERFACE`/`PI_TOR_AP_SUBNET`/`PI_TOR_AP_GATEWAY` are
+configured; `/etc/default/pi-tor-ap` is the deployed copy *plus* the
+passphrase, which is why it is mode 0600. The committed template is also what
+the config UI reads: it renders tor's `SocksPolicy accept <guest net>` from
+`PI_TOR_AP_SUBNET` in that file and never reads, mounts or exposes the live
+0600 one, so a UI config save keeps the guest accept in step with what
+`bin/pi-tor-ap` runs. Customise the subnet in the template, then reinstall it
+and re-enter the SSID/passphrase — editing only the live copy leaves tor
+denying the guest net (TCP closed before any data, DNS `REFUSED`).
+
 Host packages: `hostapd`, `dnsmasq` and `iw` on Armbian. The distro units must
 not run alongside the AP — `dnsmasq.service` would take `:53` away from
 Pi-hole, and `hostapd.service` would fight for the radio — and **apt starts
@@ -842,10 +853,15 @@ What guests get:
   `PI_TOR_DNS` chain is what confines `:53` to loopback, the tether net and the
   guest net — the guest net is in that chain precisely so a query that arrives
   on `uap0` and is addressed to the tether address is allowed. Nothing is
-  served on the uplink. If you change `PI_TOR_AP_INTERFACE`/`PI_TOR_AP_SUBNET`,
-  give the same two names to `bin/pi-tor-rules.sh` as well (the AP unit exports
-  them for its own `apply-ap`, but the ui container's `apply` only knows the
-  defaults): guests then lose DNS rather than gain an unfiltered resolver.
+  served on the uplink. The AP subnet is rendered into tor's `SocksPolicy`
+  from `PI_TOR_AP_SUBNET` in `systemd/pi-tor-ap.env.example` (the non-secret
+  template; the live `/etc/default/pi-tor-ap` is never read by the UI), so
+  that file is where a customised guest net has to be set. A customised
+  `PI_TOR_AP_INTERFACE`/`PI_TOR_AP_SUBNET` must also be given to
+  `bin/pi-tor-rules.sh` for the `:53` guard (the AP unit exports them for its
+  own `apply-ap`, but the ui container's `apply` only knows the schema
+  defaults): otherwise guests lose DNS rather than gain an unfiltered
+  resolver.
 - **TCP only through tor.** All guest TCP is DNAT'ed to
   `PI_TOR_GATEWAY:PI_TOR_TRANS_PORT`, i.e. into tor's TransPort. DNAT rather
   than REDIRECT on purpose: a REDIRECT would land on the AP interface's own
@@ -948,7 +964,8 @@ bin/uplink-check.sh        # tor-side uplink gate (IPv4 lease + default route)
 bin/usb_route[, _undo]     # host-side tether toggle + saved-state undo
 hostui/                    # host tether UI: app.py + pi-tor-hostui.service
 systemd/                   # optional stack + AP units, env examples
-                           # (pi-tor-ap.env.example ships PI_TOR_AP_PSK empty)
+                           # (pi-tor-ap.env.example ships PI_TOR_AP_PSK empty;
+                           # it is also the AP addressing the ui renders from)
 bin/gadget-watchdog.sh     # Pi-side g_ether RX-stall watchdog (reloads only
                            # on a confirmed stall, capped 3/hour)
 bin/usb-gadget-up          # configfs ECM gadget up/down/rebind/status
