@@ -7,8 +7,10 @@ used to set (`WEBPASSWORD`, `DNSMASQ_LISTENING`, `DNS_QUERY_LOGGING`,
 the consequence: `dns.listeningMode=LOCAL`, empty `dns.interface`, upstreams
 `8.8.8.8,8.8.4.4` — LAN-wide answering off the public resolvers, while the
 compose file still claimed `DNSMASQ_LISTENING=all`. These tests pin the v6
-spellings and the fail-closed direction: SINGLE on the gadget interface, one
-loopback upstream (tor's DNSPort), nothing that re-enables a dnsmasq.d dir.
+spellings: one loopback upstream (tor's DNSPort), nothing that re-enables a
+dnsmasq.d dir, and `ALL` — because SINGLE/usb0 dropped a guest query that
+arrived on the AP interface — with `bin/pi-tor-rules.sh`'s :53 guard as the
+thing that keeps DNS off the LAN (test_rules_dns_guard.py).
 """
 import contextlib
 import io
@@ -63,13 +65,22 @@ def resolve(value, envd):
 
 class PiholeV6ComposeTest(unittest.TestCase):
 
-    def test_listener_is_single_on_the_gadget_interface(self):
+    def test_listener_accepts_every_interface_and_the_rules_guard_confines_it(self):
+        # A guest query is DNAT'ed to the tether address but still *arrives*
+        # on the AP interface, and SINGLE answers only the interface it was
+        # given: the guest got no answer at all (DNAT and INPUT counters rose,
+        # no reply, no RST). ALL answers it; confining :53 to loopback, the
+        # tether and the guest link is netfilter's job, in both directions.
         env = pihole_env()
-        self.assertEqual(env["FTLCONF_dns_listeningMode"], '"SINGLE"',
-                         "SINGLE, not LOCAL/ALL: only usb0 (plus the implicit "
-                         "loopback) may be answered")
-        self.assertEqual(env["FTLCONF_dns_interface"],
-                         '"${PI_TOR_INTERFACE:-usb0}"')
+        self.assertEqual(env["FTLCONF_dns_listeningMode"], '"ALL"',
+                         "SINGLE drops a query that arrives on uap0: ALL + the "
+                         "rules guard is the fix")
+        self.assertNotIn("FTLCONF_dns_interface", env,
+                         "dns.interface is dead config under ALL, and a reader "
+                         "would take it for the restriction it no longer is")
+        rules = (REPO / "bin" / "pi-tor-rules.sh").read_text()
+        self.assertIn("dns_guard_rules()", rules,
+                      "ALL without the :53 guard is an open resolver on the LAN")
 
     def test_upstream_is_only_tors_dnsport(self):
         value = pihole_env()["FTLCONF_dns_upstreams"].strip('"')
@@ -129,8 +140,6 @@ class PiholeV6PlumbingTest(unittest.TestCase):
         self.assertEqual(rendered[".env"], rendered[".env.example"])
 
         env = pihole_env()
-        self.assertEqual(resolve(env["FTLCONF_dns_interface"], envd).strip('"'),
-                         "usb7")
         self.assertEqual(
             resolve(env["FTLCONF_dns_upstreams"], envd).strip('"'),
             "127.0.0.1#5454",

@@ -50,6 +50,11 @@ case "$*" in
   "dev wlan0 interface add uap0 type __ap")
     mkdir -p "$AP_NET_DIR/uap0" "$AP_SYSCTL_DIR/uap0"
     printf 0 > "$AP_SYSCTL_DIR/uap0/disable_ipv6" ;;
+  "dev uap0 del")
+    # the wireless way to remove an AP interface: `ip link del` answers
+    # "Operation not supported" for it on the deployed board
+    [ "${AP_TEST_IW_DEL_FAIL:-}" = 1 ] && exit 1
+    rm -rf "$AP_NET_DIR/uap0" "$AP_SYSCTL_DIR/uap0"; rm -f "$AP_ROOT/addr" ;;
   *) exit 1 ;;
 esac
 """
@@ -66,16 +71,15 @@ case "$*" in
     if [ "${AP_TEST_ADDR_WIDE:-}" = 1 ]; then
       printf '3: wlan0    inet 10.12.0.5/16 brd 10.12.255.255 scope global wlan0\\n'
     fi
+    [ -f "$AP_ROOT/addr" ] && cat "$AP_ROOT/addr"
     exit 0 ;;
   "-o -4 addr show dev uap0")
     [ -f "$AP_ROOT/addr" ] && cat "$AP_ROOT/addr"
     exit 0 ;;
   "link set uap0 up") exit 0 ;;
   "addr add 10.12.195.1/24 dev uap0")
-    printf 'inet 10.12.195.1/24 scope global uap0\\n' > "$AP_ROOT/addr" ;;
-  "link del uap0")
-    [ "${AP_TEST_IP_DEL_FAIL:-}" = 1 ] && exit 1
-    rm -rf "$AP_NET_DIR/uap0" "$AP_SYSCTL_DIR/uap0"; rm -f "$AP_ROOT/addr" ;;
+    printf '4: uap0     inet 10.12.195.1/24 brd 10.12.195.255 scope global uap0\\n' \
+      > "$AP_ROOT/addr" ;;
   *) exit 2 ;;
 esac
 """
@@ -332,6 +336,44 @@ class ApUpTest(unittest.TestCase):
         second = self.fx.run("down")
         self.assertEqual(second.returncode, 0, second.stdout + second.stderr)
 
+    def test_down_deletes_the_ap_interface_and_leaves_the_radios_alone(self):
+        self.assertEqual(self.fx.run("up").returncode, 0)
+        seen = len(self.fx.calls())
+        res = self.fx.run("down")
+        self.assertEqual(res.returncode, 0, res.stdout + res.stderr)
+        self.assertFalse((self.fx.net / "uap0").exists())
+
+        calls = self.fx.calls()[seen:]
+        # `ip link del uap0` answers "Operation not supported" on the board's
+        # driver; the interface was created by iw, so iw removes it
+        self.assertIn("iw dev uap0 del", calls)
+        self.assertFalse([c for c in calls if "link del" in c], calls)
+        # nothing else is this script's to remove: no uplink, no tether
+        self.assertFalse([c for c in calls if "wlan0" in c or "usb0" in c], calls)
+
+    def test_plan_succeeds_while_the_ap_is_active(self):
+        # the AP's own 10.12.195.1/24 is not a conflict: it is the address the
+        # preview is about, and a live re-run of `up` reuses it
+        self.assertEqual(self.fx.run("up").returncode, 0)
+        seen = len(self.fx.calls())
+        for arg in ("plan", "--dry-run"):
+            res = self.fx.run(arg)
+            self.assertEqual(res.returncode, 0, arg + res.stdout + res.stderr)
+            self.assertIn("channel 149", res.stdout, arg)
+            self.assertIn("already exists; reusing it", res.stdout + res.stderr, arg)
+        for call in self.fx.calls()[seen:]:
+            for mutation in ("interface add", " addr add", "link set",
+                             "hostapd", "dnsmasq", "ip6tables"):
+                self.assertNotIn(mutation, call, f"the preview mutated: {call}")
+
+    def test_up_reuses_an_active_ap_interface(self):
+        self.assertEqual(self.fx.run("up").returncode, 0)
+        added = [c for c in self.fx.calls() if "interface add" in c]
+        res = self.fx.run("up")
+        self.assertEqual(res.returncode, 0, res.stdout + res.stderr)
+        self.assertEqual([c for c in self.fx.calls() if "interface add" in c], added,
+                         "a live re-run created a second AP interface")
+
     def test_plan_writes_and_starts_nothing(self):
         res = self.fx.run("plan")
         self.assertEqual(res.returncode, 0, res.stdout + res.stderr)
@@ -506,7 +548,7 @@ class ApUpTest(unittest.TestCase):
         self.assertFalse(self.fx.rundir.exists())
 
     def test_rollback_reports_an_incomplete_teardown_instead_of_aborting(self):
-        res = self.fx.run("up", AP_TEST_HOSTAPD_FAIL="1", AP_TEST_IP_DEL_FAIL="1")
+        res = self.fx.run("up", AP_TEST_HOSTAPD_FAIL="1", AP_TEST_IW_DEL_FAIL="1")
         self.assertNotEqual(res.returncode, 0)
         self.assertIn("refused to start", res.stderr)
         self.assertTrue((self.fx.net / "uap0").exists(), "the stub did not fail the delete")
@@ -613,7 +655,10 @@ class ApRulesTest(unittest.TestCase):
         # management ports are not open to guests
         for port in ("--dport 22", "--dport 80", "--dport 8080"):
             self.assertFalse(any(port in l for l in acl), f"{port} exposed to guests: {acl}")
-        self.assertEqual(self.fx.chain("filter", "INPUT"), ["-i uap0 -j PI_TOR_AP_IN"])
+        hooks = self.fx.chain("filter", "INPUT")
+        self.assertEqual(hooks[:2], ["-p tcp --dport 53 -j PI_TOR_DNS",
+                                     "-p udp --dport 53 -j PI_TOR_DNS"])
+        self.assertEqual(hooks[2], "-i uap0 -j PI_TOR_AP_IN")
         # nothing is forwarded from the guest link
         self.assertEqual(self.fx.chain("filter", "FORWARD"), ["-i uap0 -j DROP"])
         # IPv6: dropped in ip6tables as well
@@ -656,7 +701,11 @@ class ApRulesTest(unittest.TestCase):
         self.assertEqual(res.returncode, 0, res.stdout + res.stderr)
 
         # position 1 everywhere: nothing earlier can accept the packet first
-        self.assertEqual(self.fx.chain("filter", "INPUT")[0], "-i uap0 -j PI_TOR_AP_IN")
+        hooks = self.fx.chain("filter", "INPUT")
+        self.assertEqual(hooks[:2], ["-p tcp --dport 53 -j PI_TOR_DNS",
+                                     "-p udp --dport 53 -j PI_TOR_DNS"])
+        self.assertEqual(hooks[2], "-i uap0 -j PI_TOR_AP_IN")
+        self.assertIn("-i uap0 -j ACCEPT", hooks[3:], hooks)
         self.assertEqual(self.fx.chain("filter", "FORWARD")[0], "-i uap0 -j DROP")
         self.assertEqual(self.fx.chain("filter", "INPUT", self.fx.state6)[0],
                          "-i uap0 -j DROP")
@@ -673,7 +722,8 @@ class ApRulesTest(unittest.TestCase):
         self.assertEqual(self.fx.rules("apply-ap").returncode, 0)
         self.assertEqual(self.fx.rules("flush-ap").returncode, 0)
 
-        self.assertEqual(self.fx.chain("filter", "INPUT"), ["-p tcp -j ACCEPT"])
+        # the seeded rule survives, behind the DNS guard that outlives the AP
+        self.assertEqual(self.fx.chain("filter", "INPUT")[2:], ["-p tcp -j ACCEPT"])
         self.assertEqual(self.fx.chain("filter", "FORWARD", self.fx.state6), ["-j ACCEPT"])
         self.assertEqual(self.fx.chain("nat", "PREROUTING"), [])
         self.assertIsNone(self.fx.chain("filter", "PI_TOR_AP_IN"))
@@ -740,9 +790,14 @@ class ApPolicyTest(unittest.TestCase):
     """The invariants that must not drift: one Pi-hole listener, no secret in
     the repo, and the unit wired to a root-only env file."""
 
-    def test_pihole_keeps_its_single_interface_and_ap_adds_no_listener(self):
+    def test_ap_adds_no_listener_and_pihole_still_answers_one_resolver(self):
+        # FTL listens on all interfaces (SINGLE dropped a query that arrived on
+        # uap0); confining :53 to the tether and the guest link is the rules
+        # script's guard, not a second Pi-hole listener. See
+        # test_rules_dns_guard.py and test_pihole_v6.py.
         compose = COMPOSE.read_text()
-        self.assertEqual(compose.count("FTLCONF_dns_interface"), 1)
+        self.assertEqual(compose.count("FTLCONF_dns_listeningMode"), 1)
+        self.assertIn('FTLCONF_dns_listeningMode: "ALL"', compose)
         self.assertNotIn("uap0", compose)
         self.assertNotIn("uap0", TORRC.read_text())
         # the AP's DNS path targets the existing listener, not a new one

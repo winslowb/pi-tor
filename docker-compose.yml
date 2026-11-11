@@ -43,18 +43,25 @@ services:
     # DNSMASQ_LISTENING, DNS_QUERY_LOGGING, PIHOLE_DNS_*) are ignored, and
     # /etc/dnsmasq.d is no longer read unless FTLCONF_misc_etc_dnsmasq_d=true.
     # That flag stays off on purpose, so these FTLCONF_* keys are the entire
-    # DNS policy: listen on the gadget interface only (loopback is implicit in
-    # SINGLE), and forward exclusively to tor's DNSPort. FTLCONF_dns_upstreams
+    # DNS policy: forward exclusively to tor's DNSPort. FTLCONF_dns_upstreams
     # must stay explicitly set: the v6 entrypoint substitutes Google's public
     # resolvers when dns.upstreams is empty (src/bash_functions.sh) — exactly
     # the live board's fallback. FTL emits no-resolv itself, so /etc/resolv.conf
     # is never consulted either way; the upstream list is the only guard.
     # Every key set here is read-only in the Pi-hole web UI.
+    #
+    # listeningMode=ALL, not SINGLE: SINGLE answers only queries that *arrive*
+    # on its one interface, and a guest's query is DNAT'ed to the tether
+    # address while still arriving on the AP interface - the live AP handed out
+    # leases and got no DNS answer at all. ALL answers whatever reaches FTL, so
+    # :53 is confined by bin/pi-tor-rules.sh's PI_TOR_DNS guard instead
+    # (loopback, the tether net, the guest net, then DROP), which keeps it off
+    # the LAN too. The tradeoff is deliberate: the firewall, not FTL, is the
+    # boundary.
     environment:
       TZ: "${PI_TOR_TZ:-UTC}"
       FTLCONF_webserver_api_password: "${PIHOLE_WEBPASSWORD:-changeme}"
-      FTLCONF_dns_listeningMode: "SINGLE"
-      FTLCONF_dns_interface: "${PI_TOR_INTERFACE:-usb0}"
+      FTLCONF_dns_listeningMode: "ALL"
       FTLCONF_dns_upstreams: "127.0.0.1#${PI_TOR_DNS_PORT:-5353}"
       FTLCONF_dns_queryLogging: "${PIHOLE_DNS_QUERY_LOGGING:-false}"
       FTLCONF_misc_dnsmasq_lines: "edns-packet-max=${PI_TOR_EDNS_PACKET_MAX:-1232}"

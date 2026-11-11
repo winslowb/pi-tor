@@ -16,7 +16,7 @@ FIELDS = {
     "interface": {
         "label": "USB gadget interface",
         "default": "usb0",
-        "targets": ".env → docker-compose.yml (FTLCONF_dns_interface), "
+        "targets": ".env → docker-compose.yml (FTLCONF_dns_upstreams), "
                    "firewall rules env, systemd env",
     },
     "uplink_interface": {

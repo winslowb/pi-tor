@@ -88,8 +88,9 @@ PIHOLE_WEBPASSWORD={cfg['pihole_webpassword']}
 # Whether Pi-hole should log every DNS query (true/false)
 PIHOLE_DNS_QUERY_LOGGING={cfg['dns_query_logging']}
 
-# Pi-hole DNS plumbing: compose substitutes these into
-# FTLCONF_dns_interface / FTLCONF_dns_upstreams / FTLCONF_misc_dnsmasq_lines
+# DNS/tether plumbing: PI_TOR_INTERFACE is the gadget interface (rules script,
+# tor); compose substitutes the other two into FTLCONF_dns_upstreams /
+# FTLCONF_misc_dnsmasq_lines
 PI_TOR_INTERFACE={cfg['interface']}
 PI_TOR_DNS_PORT={cfg['dns_port']}
 PI_TOR_EDNS_PACKET_MAX={cfg['edns_packet_max']}

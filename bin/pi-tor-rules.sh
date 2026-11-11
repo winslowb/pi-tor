@@ -23,14 +23,26 @@ GATEWAY_CIDR="${GATEWAY_IP}/${SUBNET_BITS}"
 # is given, so every tether-only call is unchanged. These rules DNAT rather
 # than REDIRECT: REDIRECT rewrites the destination to the incoming interface's
 # own address, where neither Pi-hole (:53) nor TransPort (:9040) is bound.
-# DNAT to the Pi's tether address reaches both listeners without widening
-# either one (Pi-hole keeps its SINGLE-interface policy).
+# DNAT to the Pi's tether address reaches both listeners: Pi-hole answers on
+# every interface (listeningMode=ALL) and the PI_TOR_DNS guard, not FTL, is
+# what confines :53 to loopback, the tether net and the guest net.
 AP_INTERFACE="${PI_TOR_AP_INTERFACE:-}"
 AP_CHAIN="${PI_TOR_AP_CHAIN:-PI_TOR_AP_REDIRECT}"
 AP_IN_CHAIN="${PI_TOR_AP_IN_CHAIN:-PI_TOR_AP_IN}"
 AP_SUBNET="${PI_TOR_AP_SUBNET:-10.12.195.0/24}"
 AP_GATEWAY="${PI_TOR_AP_GATEWAY:-10.12.195.1}"
 PIHOLE_PORT="${PI_TOR_PIHOLE_PORT:-53}"
+
+# DNS guard. Pi-hole's FTL runs with listeningMode=ALL (docker-compose.yml):
+# SINGLE/usb0 answered only queries that *arrived* on usb0, so a guest query
+# DNAT'ed to the tether address arrived on uap0 and got no answer at all. ALL
+# answers whatever reaches FTL, so this chain is what keeps :53 off the LAN.
+# It is the same chain for `apply` (the ui container, no AP env) and
+# `apply-ap` (the AP unit): identical content, so neither can widen or wipe
+# the other's DNS policy, and the guest allow also covers the DNAT'ed query
+# whose destination is the tether address.
+DNS_CHAIN="${PI_TOR_DNS_CHAIN:-PI_TOR_DNS}"
+AP_GUARD_INTERFACE="${PI_TOR_AP_INTERFACE:-uap0}"
 
 # Protected hosts: IPv4 addresses traffic to which must never be diverted
 # into tor (SSH :22, Pi-hole :80 and the config UI :8080 live on this host).
@@ -93,6 +105,60 @@ ap_chain_rules() {
   printf '%s\n' "-p tcp -j DNAT --to-destination ${GATEWAY_IP}:${TOR_TRANS_PORT}"
 }
 
+dns_guard_rules() {
+  # Hooked for -p udp/tcp --dport $PIHOLE_PORT only, so the ACCEPTs are DNS
+  # ACCEPTs and nothing wider. Loopback is the Pi itself (and Pi-hole's own
+  # health probes); the tether and guest nets are the two interfaces that may
+  # resolve. Everything else - the uplink/LAN above all - falls to the DROP.
+  # The AP pair falls back to bin/pi-tor-ap's defaults because `apply` (the ui
+  # container) has no AP env: a customised guest subnet must be given to this
+  # script too, or guests lose DNS - closed, never open.
+  printf '%s\n' "-i lo -j ACCEPT"
+  printf '%s\n' "-i $INTERFACE -s $SUBNET -j ACCEPT"
+  printf '%s\n' "-i $AP_GUARD_INTERFACE -s $AP_SUBNET -j ACCEPT"
+  printf '%s\n' "-j DROP"
+}
+
+# Create, refill or replace the guard. Idempotent by construction: both
+# callers (apply_rules and apply_ap_rules) install the same chain, so a
+# reapply never has to guess who owns it.
+dns_guard_apply() {
+  local proto rule
+  log "Pinning DNS: :${PIHOLE_PORT} from loopback, ${INTERFACE}/${SUBNET} and ${AP_GUARD_INTERFACE}/${AP_SUBNET}; dropped everywhere else"
+  # INPUT's policy is ACCEPT, so an emptied guard chain would resolve for the
+  # LAN. A temporary :53 DROP covers the flush/refill and only then comes out.
+  for proto in udp tcp; do
+    insert_rule_if_missing filter INPUT -p "$proto" --dport "$PIHOLE_PORT" -j DROP
+  done
+  chain_reset filter "$DNS_CHAIN"
+  while IFS= read -r rule; do
+    "$IPTABLES_BIN" -t filter -A "$DNS_CHAIN" $rule
+  done < <(dns_guard_rules)
+  for proto in udp tcp; do
+    insert_rule_if_missing filter INPUT -p "$proto" --dport "$PIHOLE_PORT" -j "$DNS_CHAIN"
+    delete_rule_if_present filter INPUT -p "$proto" --dport "$PIHOLE_PORT" -j DROP
+  done
+}
+
+dns_guard_flush() {
+  local proto
+  for proto in udp tcp; do
+    delete_rule_if_present filter INPUT -p "$proto" --dport "$PIHOLE_PORT" -j "$DNS_CHAIN"
+  done
+  chain_drop filter "$DNS_CHAIN"
+}
+
+show_dns_guard() {
+  local ipt="${IPTABLES_BIN:-iptables}" proto rule
+  echo "# DNS guard (${DNS_CHAIN}): FTL listens on every interface, so only loopback, ${INTERFACE} and ${AP_GUARD_INTERFACE} may reach :${PIHOLE_PORT} (the AP interface by default; inert while the AP is down)"
+  for proto in udp tcp; do
+    printf '%s\n' "$ipt -t filter -I INPUT 1 -p $proto --dport $PIHOLE_PORT -j $DNS_CHAIN"
+  done
+  while IFS= read -r rule; do
+    printf '%s\n' "$ipt -t filter -A $DNS_CHAIN $rule"
+  done < <(dns_guard_rules)
+}
+
 ap_filter_rules() {
   # The ACCEPTs are the only exits from this chain; the trailing DROP catches
   # QUIC and every other non-DNS UDP, ICMP, mDNS, a guest reaching the Pi's
@@ -144,6 +210,7 @@ show_rules() {
     printf '%s\n' "$ipt -t filter -A $chain -i $INTERFACE -s $SUBNET -j ACCEPT"
   done
   printf '%s\n' "$ipt -t filter -A FORWARD -o $INTERFACE -d $SUBNET -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT"
+  show_dns_guard
   show_ap_rules
 }
 
@@ -285,6 +352,8 @@ apply_rules() {
   add_rule_if_missing filter FORWARD -i "$INTERFACE" -s "$SUBNET" -j ACCEPT
   add_rule_if_missing filter FORWARD -o "$INTERFACE" -d "$SUBNET" -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
 
+  dns_guard_apply
+
   if ip link show "$INTERFACE" >/dev/null 2>&1; then
     log "Publishing ${GATEWAY_IP} on ${INTERFACE}"
     # capture first: `grep -q` closes the pipe early and SIGPIPEs `ip`, which
@@ -315,6 +384,9 @@ flush_rules() {
     delete_rule_if_present filter "$chain" -i "$INTERFACE" -p udp '!' --dport 53 -j DROP
     delete_rule_if_present filter "$chain" -i "$INTERFACE" -p udp --dport "$TOR_DNS_PORT" -j ACCEPT
   done
+
+  log "Removing the DNS guard"
+  dns_guard_flush
 
   log "Cleaning ACCEPT rules"
   delete_rule_if_present filter INPUT -i "$INTERFACE" -s "$SUBNET" -j ACCEPT
@@ -361,6 +433,7 @@ apply_ap_rules() {
   # Guests are never routed anywhere by this host: tor captures their TCP.
   insert6_rule_if_missing filter INPUT -i "$AP_INTERFACE" -j DROP
   insert6_rule_if_missing filter FORWARD -i "$AP_INTERFACE" -j DROP
+  dns_guard_apply
 }
 
 flush_ap_rules() {

@@ -5,8 +5,12 @@ A minimal Docker stack for a USB-gadget Raspberry Pi that runs Pi-hole as the DN
 ## What you get
 
 - Hardened Tor container (Debian slim base) with dedicated `torrc`
-- Pi-hole configured to listen only on gadget + loopback interfaces and to use
-  Tor as its upstream resolver
+- Pi-hole answering on every interface and forwarding only to Tor, with a
+  netfilter guard (`PI_TOR_DNS`) that confines `:53` to loopback, the gadget
+  subnet and the guest subnet and drops it everywhere else — the LAN
+  included. FTL cannot make that distinction itself: it answers by *arriving*
+  interface, and a guest query arrives on the AP interface while addressed to
+  the gadget address — so the firewall, not FTL, is the boundary
 - Idempotent iptables helper (`bin/pi-tor-rules.sh`) that turns the Pi into a
   transparent proxy for the gadget interface. `PI_TOR_PROTECTED_HOSTS`
   (default: the gateway IP) keeps traffic to the Pi itself out of the
@@ -16,7 +20,9 @@ A minimal Docker stack for a USB-gadget Raspberry Pi that runs Pi-hole as the DN
   on the gadget interface (INPUT and FORWARD): TCP and DNS are redirected
   into tor but UDP is not, so QUIC would go direct (unprotected) or hang —
   the drop forces the TCP fallback that tor carries. This also kills mDNS
-  and any other UDP on the tether, which is intended. The **ui
+  and any other UDP on the tether, which is intended. The same script owns
+  the :53 guard described above (`apply` and `apply-ap` install the same
+  chain; `flush` removes it, `flush-ap` deliberately leaves it). The **ui
   container applies the rules itself** — once when it starts (idempotent)
   and on demand from the dashboard — and refuses to apply a config whose
   protected hosts omit the gateway, because that would lock you out
@@ -117,7 +123,10 @@ it should look like this when your ready to go;
 Stop everything by running `docker compose down` followed by
 `sudo bin/pi-tor-rules.sh flush` (or the *Flush firewall rules* button in
 the config UI while the stack is up — HTTP to the Pi's own address stays
-reachable because the RETURN rule keeps it out of the redirect).
+reachable because the RETURN rule keeps it out of the redirect). Note that
+`flush` removes the :53 guard too: while Pi-hole keeps running (or is started
+without the ui container) its resolver answers on every interface, so treat
+flush as "stack down" and re-run `apply` when it comes back.
 
 ## Customisation checklist
 
@@ -395,40 +404,74 @@ in config file`).
 That v6 fix is now deployed on the board (commit `6bb4752`, applied with
 `docker compose up -d --build pihole ui`). Compose sets the supported keys:
 the password via `FTLCONF_webserver_api_password`, and the DNS policy via
-`FTLCONF_dns_listeningMode=SINGLE`, `FTLCONF_dns_interface`,
-`FTLCONF_dns_upstreams=127.0.0.1#<DNSPort>` and `FTLCONF_dns_queryLogging`
-(EDNS size goes through `FTLCONF_misc_dnsmasq_lines`).
+`FTLCONF_dns_listeningMode`, `FTLCONF_dns_upstreams=127.0.0.1#<DNSPort>` and
+`FTLCONF_dns_queryLogging` (EDNS size goes through
+`FTLCONF_misc_dnsmasq_lines`). That deploy also set
+`FTLCONF_dns_interface=usb0` with `SINGLE`; that pair is gone — see below.
 `FTLCONF_misc_etc_dnsmasq_d` stays off, so no `/etc/dnsmasq.d` file can widen
 the listener or add an upstream; the directory is no longer mounted and the
 old v5 snippets were moved to a root-only backup outside the Compose project.
 A key set this way is **read-only in the Pi-hole web UI**.
 
-Live readback (`pihole-FTL --config <key>`) matches that environment:
-
-    dns.listeningMode  = SINGLE
-    dns.interface      = usb0
-    dns.upstreams      = [ 127.0.0.1#5353 ]
-    dns.queryLogging   = false
-    misc.dnsmasq_lines = [ edns-packet-max=1232 ]
-    misc.etc_dnsmasq_d = false
-
-Startup logged `6 FTLCONF environment variables found (6 used, 0 invalid, 0
-ignored)` and `Assigning password by Environment Variable`, with no random
-password and no `8.8.8.8` fallback. Functionally: queries to the gadget address
+Live readback after that deploy (`pihole-FTL --config <key>`) showed
+`dns.listeningMode = SINGLE`, `dns.interface = usb0`,
+`dns.upstreams = [ 127.0.0.1#5353 ]`, `dns.queryLogging = false`,
+`misc.dnsmasq_lines = [ edns-packet-max=1232 ]`,
+`misc.etc_dnsmasq_d = false`, and startup logged `6 FTLCONF environment
+variables found (6 used, 0 invalid, 0 ignored)` with no random password and no
+`8.8.8.8` fallback. Functionally, then: queries to the gadget address
 `10.12.194.1` returned real A records, a unique query to the board's LAN
 address `192.168.0.27` timed out from both the tether host and pihole.lan, and
-two 20-second `tcpdump` captures on rzero's uplink interface (`wlan0`), taken
-during fresh queries, saw zero packets to TCP/UDP 53 — no DNS leaves the board
-off the Tor path.
+two 20-second `tcpdump` captures on rzero's uplink (`wlan0`) during fresh
+queries saw zero packets to TCP/UDP 53 — no DNS leaves the board off the Tor
+path.
 
-`ss` still shows pihole-FTL on `0.0.0.0:53` and the log says `listening on
-0.0.0.0 port 53`. That is expected, not a leak: `SINGLE` +
-`dns.interface=usb0` becomes dnsmasq `interface=usb0` *without*
-`bind-interfaces`, so dnsmasq binds the wildcard socket and drops queries that
-arrive on any other interface. Judge this setting from the interface-level
-negative/positive test above, never from `ss` or that log line.
+`ss` shows pihole-FTL on `0.0.0.0:53` and the log says `listening on 0.0.0.0
+port 53`. That is the wildcard socket, and it says nothing about which queries
+FTL answers: judge the listener from an interface-level test (a query from the
+tether, a query from a guest, a query from the LAN that must time out), never
+from `ss` or that log line.
 
-Not exercised by this deploy: cold boot, a real watchdog RX-stall recovery, a
+#### Why `ALL` plus a firewall guard, not `SINGLE`
+
+`SINGLE` answers only queries that *arrive* on the interface it was given
+(`dns.interface`), and the Wi-Fi AP broke exactly that assumption: a guest's
+query is DNAT'ed to the gadget address `10.12.194.1:53` before the filter
+table sees it, so it reaches FTL addressed to the gadget but arriving on
+`uap0`, and FTL dropped it. The board showed it plainly — the AP's DNAT and
+INPUT counters rose, the guest's capture showed the query and no reply (not
+even a refusal), and `dig @10.12.194.1` over the tether still worked. Netfilter
+was not dropping it; the resolver was.
+
+So FTL runs `listeningMode = ALL` (it answers what reaches it, whatever
+interface that was) and `bin/pi-tor-rules.sh` installs the boundary instead:
+
+    -i lo -j ACCEPT                          # the Pi itself
+    -i usb0 -s 10.12.194.0/24 -j ACCEPT      # tether
+    -i uap0 -s 10.12.195.0/24 -j ACCEPT      # Wi-Fi guests (defaults)
+    -j DROP
+
+hooked from filter `INPUT` at position 1 for `-p udp --dport 53` and `-p tcp
+--dport 53`, so a broad `ACCEPT` installed earlier by Docker or a distro
+firewall cannot see DNS first. The chain is in `INPUT`, so every packet that
+reaches it is addressed to this host: an `ACCEPT` there can only mean "DNS to
+the Pi", never a guest reaching an outside resolver. `dns.interface` is gone
+because `ALL` ignores it, and a key that looks like a restriction but is not
+one is worse than no key.
+
+The tradeoff is deliberate and it is the firewall, not FTL, that is now the
+boundary: if the rules are flushed while Pi-hole runs, DNS is answered on every
+interface until `apply` runs again, and `flush` therefore means "stack down"
+(see the quick start). What stays unchanged is the upstream: still only
+`127.0.0.1#<DNSPort>`, so no query resolves off the Tor path. The narrower
+alternative — adding `uap0` to FTL's interface list instead of `ALL` — was
+rejected because FTL/dnsmasq refuses to start when a configured interface does
+not exist yet, and the AP is optional: Pi-hole must come up with the AP absent.
+
+Not run on the board yet: this `ALL` + guard pair. What to check after the
+recreate is in the AP section below.
+
+Not exercised by that deploy: cold boot, a real watchdog RX-stall recovery, a
 live password change, and the rollback path. `node_exporter` is unchanged
 (`:9100` HTTP 200, same PID) and the `tor` container kept its `StartedAt` and
 restart count; the management surfaces remain separately exposed and
@@ -672,6 +715,7 @@ sudoedit /etc/default/pi-tor-ap           # SSID + PI_TOR_AP_PSK (8-63 chars)
 sudo install -m 0644 systemd/pi-tor-ap.service /etc/systemd/system/
 sudo systemctl daemon-reload              # the enable below needs it on disk
 sudo bin/pi-tor-ap plan                   # what it would do; changes nothing
+                                          # (safe with the AP live or absent)
 sudo bin/pi-tor-ap up                     # then check from a phone
 sudo bin/pi-tor-ap down                   # stops daemons, deletes the AP
                                           # interface, flushes the AP rules
@@ -721,10 +765,17 @@ What guests get:
   input chain admits exactly two DHCP packets: a client with no lease yet
   (`0.0.0.0:68 -> 255.255.255.255:67`) and a renewal from inside the guest
   `/24` to the AP gateway on the same port pair.
-- **Pi-hole DNS, without widening Pi-hole.** Guest `udp/tcp 53` is DNAT'ed to
-  `PI_TOR_GATEWAY:53`. Pi-hole keeps its `FTLCONF_dns_interface` (the tether
-  interface, `SINGLE`) and its tor-only upstream: no second listener, no
-  extra dnsmasq line, nothing exposed on the uplink.
+- **Pi-hole DNS, without a second listener.** Guest `udp/tcp 53` is DNAT'ed to
+  `PI_TOR_GATEWAY:53`, and Pi-hole keeps its tor-only upstream. There is no
+  second resolver and no extra dnsmasq line; FTL answers the query because it
+  runs `listeningMode=ALL` (see "Why `ALL` plus a firewall guard"), and the
+  `PI_TOR_DNS` chain is what confines `:53` to loopback, the tether net and the
+  guest net — the guest net is in that chain precisely so a query that arrives
+  on `uap0` and is addressed to the tether address is allowed. Nothing is
+  served on the uplink. If you change `PI_TOR_AP_INTERFACE`/`PI_TOR_AP_SUBNET`,
+  give the same two names to `bin/pi-tor-rules.sh` as well (the AP unit exports
+  them for its own `apply-ap`, but the ui container's `apply` only knows the
+  defaults): guests then lose DNS rather than gain an unfiltered resolver.
 - **TCP only through tor.** All guest TCP is DNAT'ed to
   `PI_TOR_GATEWAY:PI_TOR_TRANS_PORT`, i.e. into tor's TransPort. DNAT rather
   than REDIRECT on purpose: a REDIRECT would land on the AP interface's own
@@ -773,17 +824,28 @@ Constraints that cannot be designed around:
   connected route* the board already has (an uplink on a wider `/16` covers the
   guest `/24` without any address matching it), any overlap with the tether
   subnet, and — with `ss` available — a host where nothing listens on Pi-hole's `:53` or tor's
-  TransPort, which would leave guests with a lease and no way out.
+  TransPort, which would leave guests with a lease and no way out. The AP's
+  *own* address is not a conflict: the check skips addresses on `uap0` itself,
+  which is what lets `plan` preview a live AP and a re-run of `up` reuse it.
 - **Management stays on the tether.** Guests cannot reach the Pi's admin
   ports at all; manage the board over `usb0` or the LAN as before.
 - Deliberately not in the config UI: the AP is host-level (it needs `iw`,
   `hostapd` and `dnsmasq` on the host, not in a container) and the passphrase
   must not flow through the rendered `.env`.
-- Not yet verified on hardware: that Pi-hole answers a DNAT'ed guest query
-  that arrived on the AP interface but is addressed to its tether address. If
-  it does not, guests get *no* DNS (the DNAT target is the only resolver in
-  their input chain) — the failure is closed, but it is the first thing to
-  check on the board. Also unverified there: the `ss` probe against the
+- **Teardown removes the interface the way it was created.** `down` runs
+  `iw dev uap0 del`: `ip link del uap0` answers `Operation not supported` for
+  an AP-mode interface on this driver, and only the AP interface is touched —
+  the uplink (`wlan0`) and the tether (`usb0`) are never removed.
+- **Verified on the board, and what was found.** A guest associated, got a
+  lease and had its DNS query captured arriving on `uap0` addressed to
+  `10.12.195.1:53`; the AP's DNAT and INPUT counters rose and no reply ever
+  came back, while `dig @10.12.194.1` over the tether still answered. That is
+  the `SINGLE` interface filter, not routing or the firewall: see "Why `ALL`
+  plus a firewall guard". **Not yet run on the board**: the `ALL` + `PI_TOR_DNS`
+  guard that replaces it — after `docker compose up -d --build pihole ui`
+  (plus a `bin/pi-tor-rules.sh apply`), the check is `dig` from the tether
+  (answers), `dig` from a guest (answers), and `dig @<board LAN address>` from
+  the LAN (must time out). Also unverified there: the `ss` probe against the
   containerized Pi-hole and tor listeners, and that the inserted hooks really
   do land ahead of Docker's own `PREROUTING`/`FORWARD` rules (the tests prove
   the ordering against a simulated ruleset, not against this board's netfilter).

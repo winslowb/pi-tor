@@ -273,8 +273,10 @@ preflight() {
   if ! addrs=$("$IP" -o -4 addr show 2>/dev/null); then
     die "cannot read this host's IPv4 addresses ('$IP -o -4 addr show' failed): the AP subnet cannot be proven absent from this host, so the AP is not coming up"
   fi
+  # An address on the AP interface itself is the AP's own, not a conflict:
+  # `up` reuses a live interface and `plan` has to preview a live AP.
   for cidr in $(printf '%s\n' "$addrs" |
-    awk '{ for (i = 1; i < NF; i++) if ($i == "inet") { print $(i + 1); break } }'); do
+    awk -v ap="$AP_IF" '$2 != ap { for (i = 1; i < NF; i++) if ($i == "inet") { print $(i + 1); break } }'); do
     if cidr_overlap "$NET.0/$PREFIX" "$cidr"; then
       die "PI_TOR_AP_SUBNET ($AP_SUBNET) is already configured on this host ($cidr): pick a /24 this board is not on"
     fi
@@ -492,8 +494,10 @@ down() {
   rundir_ok   # before anything is removed: the path is the destructive part
   require_root
   stop_daemons
+  # `ip link del` answers "Operation not supported" for an AP-mode interface
+  # on this driver; the interface was created by iw, so iw removes it.
   if [ -e "$NET_DIR/$AP_IF" ]; then
-    run "$IP" link del "$AP_IF"
+    run "$IW" dev "$AP_IF" del
   fi
   if [ -f "$RULES" ]; then
     if [ "$MODE" = dry ]; then
