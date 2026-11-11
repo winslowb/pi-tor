@@ -65,7 +65,18 @@ STUB = textwrap.dedent("""\
 """)
 
 
-ENV_KEYS = ("IPTABLES_BIN", "PI_TOR_FAKE_STATE", "PI_TOR_FAKE_ROOT",
+# ip6tables is the same simulator against a second state dir: the guard
+# installs the :53 policy in both families, and the script refuses to run
+# without it (fail closed), so the fixture has to provide one.
+STUB6 = textwrap.dedent("""\
+    #!/usr/bin/env bash
+    set -u
+    PI_TOR_FAKE_STATE="${PI_TOR_FAKE_STATE6:?PI_TOR_FAKE_STATE6 required}" \
+        exec "${PI_TOR_IPTABLES_STUB:?PI_TOR_IPTABLES_STUB required}" "$@"
+""")
+
+ENV_KEYS = ("IPTABLES_BIN", "IP6TABLES_BIN", "PI_TOR_FAKE_STATE",
+            "PI_TOR_FAKE_STATE6", "PI_TOR_IPTABLES_STUB", "PI_TOR_FAKE_ROOT",
             "PI_TOR_FAKE_VERSION", "PI_TOR_UI_DRY_RUN")
 
 
@@ -75,10 +86,15 @@ class StartupApplyTest(unittest.TestCase):
         self.tree = make_config_tree()
         self.tmp = tempfile.mkdtemp(prefix="pi-tor-fake-iptables-")
         self.state = os.path.join(self.tmp, "state")
+        self.state6 = os.path.join(self.tmp, "state6")
         self.stub = os.path.join(self.tmp, "iptables-stub")
         with open(self.stub, "w") as f:
             f.write(STUB)
         os.chmod(self.stub, 0o755)
+        self.stub6 = os.path.join(self.tmp, "ip6tables-stub")
+        with open(self.stub6, "w") as f:
+            f.write(STUB6)
+        os.chmod(self.stub6, 0o755)
         self.old_env = {k: os.environ.pop(k, None) for k in ENV_KEYS}
 
     def tearDown(self):
@@ -92,7 +108,10 @@ class StartupApplyTest(unittest.TestCase):
 
     def _use_stub(self, version="iptables v1.8.99 (nf_tables)"):
         os.environ.update({"IPTABLES_BIN": self.stub,
+                           "IP6TABLES_BIN": self.stub6,
                            "PI_TOR_FAKE_STATE": self.state,
+                           "PI_TOR_FAKE_STATE6": self.state6,
+                           "PI_TOR_IPTABLES_STUB": self.stub,
                            "PI_TOR_FAKE_ROOT": "1",
                            "PI_TOR_FAKE_VERSION": version})
 
@@ -115,6 +134,18 @@ class StartupApplyTest(unittest.TestCase):
         self.assertEqual(
             [l for l in chain if l.endswith("-j RETURN")],
             ["-d 10.12.194.1 -j RETURN"])
+
+        # the :53 guard is part of that same apply, in both families
+        self.assertEqual(
+            open(os.path.join(self.state, "filter", "PI_TOR_DNS"),
+                 encoding="utf-8").read().splitlines(),
+            ["-i lo -j ACCEPT", "-i usb0 -s 10.12.194.0/24 -j ACCEPT",
+             "-i uap0 -s 10.12.195.0/24 -j ACCEPT", "-j DROP"])
+        self.assertEqual(
+            open(os.path.join(self.state6, "filter", "PI_TOR_DNS"),
+                 encoding="utf-8").read().splitlines(),
+            ["-i lo -j ACCEPT", "-j DROP"],
+            "the ui's startup apply left FTL's IPv6 :53 unguarded")
 
         # a second simulated start leaves the state unchanged
         res2 = apply_mod.startup_rules_apply(self.tree)
@@ -149,6 +180,13 @@ class StartupApplyTest(unittest.TestCase):
         self.assertIn("legacy", res["error"])
         self.assertIn("nf_tables", res["error"])
         # refusal happened before the script ran: no chain state exists
+        self.assertFalse(os.path.exists(os.path.join(self.state, "nat")))
+
+        # flush writes as well now (it re-installs the :53 guard), so it gets
+        # the same refusal instead of half-writing through a legacy binary
+        values = render.read_current(self.tree)["values"]
+        self.assertIn("legacy", dockerops.run_rules(self.tree, values,
+                                                    action="flush")["error"])
         self.assertFalse(os.path.exists(os.path.join(self.state, "nat")))
 
         # the nft flavour applies normally

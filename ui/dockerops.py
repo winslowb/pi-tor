@@ -220,14 +220,15 @@ def run_rules(root, values, action="apply"):
         return {"skipped": "dry-run"}
     if action not in ("apply", "flush"):
         return {"error": f"unknown rules action {action!r}"}
-    if action == "apply":
-        backend = iptables_backend()
-        if backend.get("backend") != "nf_tables":
-            return {"error": f"refusing to apply: the iptables backend is "
-                             f"{backend.get('backend') or 'unavailable'}, not "
-                             "nf_tables — a legacy ruleset would diverge from "
-                             "the host's",
-                    "backend": backend}
+    # flush writes too (it re-installs the :53 guard instead of removing it),
+    # so both actions have to go through the host's backend
+    backend = iptables_backend()
+    if backend.get("backend") != "nf_tables":
+        return {"error": f"refusing to apply: the iptables backend is "
+                         f"{backend.get('backend') or 'unavailable'}, not "
+                         "nf_tables — a legacy ruleset would diverge from "
+                         "the host's",
+                "backend": backend}
     script = os.path.join(str(root), "bin", "pi-tor-rules.sh")
     if not os.path.isfile(script):
         return {"error": f"{script} not found (project not mounted?)"}

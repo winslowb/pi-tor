@@ -11,8 +11,8 @@ A minimal Docker stack for a USB-gadget Raspberry Pi that runs Pi-hole as the DN
   included. FTL cannot make that distinction itself: it answers by *arriving*
   interface, and a guest query arrives on the AP interface while addressed to
   the gadget address — so the firewall, not FTL, is the boundary
-- Idempotent iptables helper (`bin/pi-tor-rules.sh`) that turns the Pi into a
-  transparent proxy for the gadget interface. `PI_TOR_PROTECTED_HOSTS`
+- Idempotent iptables **and ip6tables** helper (`bin/pi-tor-rules.sh`) that
+  turns the Pi into a transparent proxy for the gadget interface. `PI_TOR_PROTECTED_HOSTS`
   (default: the gateway IP) keeps traffic to the Pi itself out of the
   redirect, so SSH, Pi-hole and the config UI keep working; `show-rules`
   prints the exact nat **and filter** rule list, in apply order, without
@@ -21,10 +21,12 @@ A minimal Docker stack for a USB-gadget Raspberry Pi that runs Pi-hole as the DN
   into tor but UDP is not, so QUIC would go direct (unprotected) or hang —
   the drop forces the TCP fallback that tor carries. This also kills mDNS
   and any other UDP on the tether, which is intended. The same script owns
-  the :53 guard described above (`apply` and `apply-ap` install the same
-  chain; `flush` removes it, `flush-ap` deliberately leaves it). The **ui
-  container applies the rules itself** — once when it starts (idempotent)
-  and on demand from the dashboard — and refuses to apply a config whose
+  the :53 guard described above: `apply`, `apply-ap` and the bare `guard`
+  action install it, and **nothing removes it** — `flush` takes the tether
+  redirect out but re-installs the guard, because FTL may still be listening
+  in `ALL` mode (`flush-ap` leaves it too). The **ui container applies the
+  rules itself** — once when it starts (idempotent) and on demand from the
+  dashboard — and refuses to apply a config whose
   protected hosts omit the gateway, because that would lock you out
 - `bin/uplink-check.sh` gates **only** the tor container: tor refuses to
   start when the uplink interface has no IPv4 lease or no default route.
@@ -123,10 +125,13 @@ it should look like this when your ready to go;
 Stop everything by running `docker compose down` followed by
 `sudo bin/pi-tor-rules.sh flush` (or the *Flush firewall rules* button in
 the config UI while the stack is up — HTTP to the Pi's own address stays
-reachable because the RETURN rule keeps it out of the redirect). Note that
-`flush` removes the :53 guard too: while Pi-hole keeps running (or is started
-without the ui container) its resolver answers on every interface, so treat
-flush as "stack down" and re-run `apply` when it comes back.
+reachable because the RETURN rule keeps it out of the redirect). `flush`
+removes the tether redirect and the non-DNS UDP drops; it deliberately
+**keeps the `:53` guard** (IPv4 and IPv6) and re-installs it if it was
+missing, because Pi-hole may still be running with `listeningMode=ALL` and a
+flush must never publish a resolver. The leftover guard is inert while
+nothing listens (nothing else on this host answers `:53`); drop it by hand
+only when you know no FTL is running.
 
 ## Customisation checklist
 
@@ -160,29 +165,51 @@ following files if your gadget interface or network differs:
 
 ## Systemd (optional)
 
-The firewall rules need no unit of their own: the ui container applies
-them on start, so `docker compose up` is the only bring-up step. To have
-the stack come up on boot:
+Pi-hole runs `listeningMode=ALL`, so FTL answers on every interface the
+moment it starts — on boot that is before the ui container exists.
+`systemd/pi-tor-guard.service` installs the `:53` guard (IPv4 and IPv6)
+*before* docker starts any container, so there is no window in which FTL is
+an open resolver; docker restarts keep the rules, because they live in the
+kernel in chains docker does not own. To have the stack come up on boot:
 
 1. Copy `systemd/pi-tor.env.example` to `/etc/default/pi-tor` (any
-   `PI_TOR_*` overrides there feed the units). The units assume the checkout
-   is at `/opt/pi-tor`; if yours is not, edit their `ExecStart`/
-   `WorkingDirectory` paths — systemd cannot expand a variable into a path.
-2. Copy the stack unit:
+   `PI_TOR_*` overrides there feed the units, the guard included). The units
+   assume the checkout is at `/opt/pi-tor`; if yours is not, edit their
+   `ExecStart`/`WorkingDirectory` paths — systemd cannot expand a variable
+   into a path.
+2. Copy both units:
    ```bash
-   sudo cp systemd/pi-tor-stack.service /etc/systemd/system/
+   sudo cp systemd/pi-tor-guard.service systemd/pi-tor-stack.service \
+           /etc/systemd/system/
    ```
 3. `sudo systemctl daemon-reload`
-4. Enable + start:
+4. Enable the guard first, then the stack:
    ```bash
+   sudo systemctl enable --now pi-tor-guard.service
    sudo systemctl enable --now pi-tor-stack.service
    ```
 
+Keep `/etc/default/pi-tor` in step with what the config UI renders into
+`.env`: the guard allows DNS on the interface and subnets it is given, so a
+tether interface changed in the UI but not there loses DNS over the tether
+(closed, never open — the fix is to update the file and
+`systemctl restart pi-tor-guard.service`).
+
 `pi-tor-stack` runs `docker compose up -d --build` from `/opt/pi-tor` on
-boot; the ui container inside it applies the firewall rules. For a manual
-run of the rules themselves (e.g. flushing after a `compose down`),
-`bin/pi-tor-rules.sh apply|flush|show-rules` remains the single
-implementation — run it with `sudo` when the stack is not up.
+boot and carries `Requires=pi-tor-guard.service` with `After=` it, so enabling
+only the stack still starts the guard first — and a guard that cannot be
+installed fails the stack instead of leaving Pi-hole unguarded. The ui container inside the stack
+re-applies the same rules (idempotent) — that is a refresh, not the boundary.
+
+Starting the stack by hand instead of through the unit (`docker compose up -d
+--build` from the quick start) skips the guard unit; the ui container then
+closes the window once it starts, exactly as before. Run
+`sudo bin/pi-tor-rules.sh guard` first if you want it shut from the start.
+
+`bin/pi-tor-rules.sh` remains the single implementation:
+`apply|guard|flush|show-rules` (plus `apply-ap|flush-ap` for the guest AP).
+`guard` installs the `:53` policy only, `apply` adds the tether redirect, and
+`flush` removes the redirect while keeping the guard. Run it with `sudo`.
 
 ## Config UI (ui/) — the stack edited from a browser
 
@@ -356,8 +383,9 @@ carries `Wants=pi-tor-gadget.service` as well as
 `After=pi-tor-gadget.service docker.service`, so enabling only the stack
 still starts the gadget; `Wants` rather than `Requires` means a gadget
 failure is logged instead of holding the stack back, and the UI then
-explains the missing tether. The ui container applies the firewall rules at
-startup, so there is still no separate rules unit.
+explains the missing tether. `pi-tor-guard.service` is the one rules unit
+there is, and it runs `Before=docker.service`; the ui container's startup
+apply only refreshes what it installed.
 
 `up` is idempotent even over a partially torn-down gadget: an unbound but
 composed one is reused, and `ifname` is not rewritten (configfs refuses that
@@ -460,9 +488,23 @@ because `ALL` ignores it, and a key that looks like a restriction but is not
 one is worse than no key.
 
 The tradeoff is deliberate and it is the firewall, not FTL, that is now the
-boundary: if the rules are flushed while Pi-hole runs, DNS is answered on every
-interface until `apply` runs again, and `flush` therefore means "stack down"
-(see the quick start). What stays unchanged is the upstream: still only
+boundary — which is why nothing in this repo takes it down: `flush` removes the
+tether redirect and then re-installs the guard, and
+`systemd/pi-tor-guard.service` installs it before docker starts Pi-hole, so
+there is no boot window either. Two things the guard has to cover that FTL
+cannot:
+
+- **IPv6.** `ALL` binds `::` as well as `0.0.0.0`, so the same policy is
+  installed in `ip6tables`: loopback only, because nothing else here has IPv6
+  (the tether is built with `LinkLocalAddressing=no`, the guest link has
+  `disable_ipv6` set and is dropped on `uap0`). `apply`, `apply-ap` and
+  `guard` all refuse to run when `ip6tables` is missing rather than leaving
+  that family open.
+- **Ordering.** The hooks go in at filter `INPUT` position 1, and a reapply
+  holds a temporary `:53` DROP over the chain's flush-and-refill, so no
+  packet sees a half-built guard.
+
+What stays unchanged is the upstream: still only
 `127.0.0.1#<DNSPort>`, so no query resolves off the Tor path. The narrower
 alternative — adding `uap0` to FTL's interface list instead of `ALL` — was
 rejected because FTL/dnsmasq refuses to start when a configured interface does

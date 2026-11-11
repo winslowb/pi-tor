@@ -219,7 +219,9 @@ class Handler(BaseHTTPRequestHandler):
             # flush is the recovery path and needs no validation: it stays
             # reachable over HTTP to the Pi's own address because the chain's
             # RETURN rule keeps that traffic out of the redirect, and flush
-            # works whatever the current config says
+            # works whatever the current config says. It removes the redirect
+            # but keeps (and re-installs) the :53 guard: FTL is still in ALL
+            # mode, so a flush must never publish a resolver.
             values = render.read_current(ROOT)["values"]
             self._json(200, dockerops.run_rules(ROOT, values, action="flush"))
         else:

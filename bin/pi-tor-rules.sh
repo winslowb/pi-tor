@@ -119,9 +119,19 @@ dns_guard_rules() {
   printf '%s\n' "-j DROP"
 }
 
-# Create, refill or replace the guard. Idempotent by construction: both
-# callers (apply_rules and apply_ap_rules) install the same chain, so a
-# reapply never has to guess who owns it.
+dns_guard6_rules() {
+  # IPv6 counterpart of dns_guard_rules. No IPv6 path is approved: the tether
+  # is built with LinkLocalAddressing=no (bin/usb-gadget-up), the guest link
+  # has disable_ipv6 set and is dropped in ip6tables (bin/pi-tor-ap), so
+  # loopback - the Pi itself - is the only IPv6 source that may resolve.
+  printf '%s\n' "-i lo -j ACCEPT"
+  printf '%s\n' "-j DROP"
+}
+
+# Create, refill or replace the guard. Idempotent by construction: every
+# caller (apply_rules, apply_ap_rules, flush_rules and the `guard` action)
+# installs the same chain in both families, so a reapply never has to guess
+# who owns it.
 dns_guard_apply() {
   local proto rule
   log "Pinning DNS: :${PIHOLE_PORT} from loopback, ${INTERFACE}/${SUBNET} and ${AP_GUARD_INTERFACE}/${AP_SUBNET}; dropped everywhere else"
@@ -138,14 +148,25 @@ dns_guard_apply() {
     insert_rule_if_missing filter INPUT -p "$proto" --dport "$PIHOLE_PORT" -j "$DNS_CHAIN"
     delete_rule_if_present filter INPUT -p "$proto" --dport "$PIHOLE_PORT" -j DROP
   done
+  dns_guard6_apply
 }
 
-dns_guard_flush() {
-  local proto
+dns_guard6_apply() {
+  # Same sequence as the v4 body above, for the other family: temporary :53
+  # DROPs, flush and refill the chain, then hook and drop the stops.
+  local proto rule
+  log "Pinning IPv6 DNS: :${PIHOLE_PORT} from loopback only (no IPv6 on the tether or the guest link); dropped everywhere else"
   for proto in udp tcp; do
-    delete_rule_if_present filter INPUT -p "$proto" --dport "$PIHOLE_PORT" -j "$DNS_CHAIN"
+    insert6_rule_if_missing filter INPUT -p "$proto" --dport "$PIHOLE_PORT" -j DROP
   done
-  chain_drop filter "$DNS_CHAIN"
+  chain_reset6 filter "$DNS_CHAIN"
+  while IFS= read -r rule; do
+    "$IP6TABLES_BIN" -t filter -A "$DNS_CHAIN" $rule
+  done < <(dns_guard6_rules)
+  for proto in udp tcp; do
+    insert6_rule_if_missing filter INPUT -p "$proto" --dport "$PIHOLE_PORT" -j "$DNS_CHAIN"
+    delete6_rule_if_present filter INPUT -p "$proto" --dport "$PIHOLE_PORT" -j DROP
+  done
 }
 
 show_dns_guard() {
@@ -157,6 +178,14 @@ show_dns_guard() {
   while IFS= read -r rule; do
     printf '%s\n' "$ipt -t filter -A $DNS_CHAIN $rule"
   done < <(dns_guard_rules)
+  echo "# the same guard in ip6tables: FTL binds :: under ALL too, and nothing else here has IPv6"
+  local ip6t="${IP6TABLES_BIN:-ip6tables}"
+  for proto in udp tcp; do
+    printf '%s\n' "$ip6t -t filter -I INPUT 1 -p $proto --dport $PIHOLE_PORT -j $DNS_CHAIN"
+  done
+  while IFS= read -r rule; do
+    printf '%s\n' "$ip6t -t filter -A $DNS_CHAIN $rule"
+  done < <(dns_guard6_rules)
 }
 
 ap_filter_rules() {
@@ -231,9 +260,9 @@ resolve_ip6tables() {
   elif command -v ip6tables >/dev/null 2>&1; then
     command -v ip6tables
   else
-    # Fail closed: without ip6tables a guest keeps its link-local address and
-    # any IPv6 path the rest of the network offers would bypass the v4 rules.
-    echo "[pi-tor] refusing to apply AP rules: ip6tables(8) not found, so guest IPv6 could not be blocked" >&2
+    # Fail closed: without ip6tables the DNS guard would cover IPv4 only, and
+    # FTL under ALL binds :: as well - an unguarded resolver on the LAN.
+    echo "[pi-tor] refusing to apply: ip6tables(8) not found, so DNS over IPv6 could not be confined to loopback" >&2
     exit 1
   fi
 }
@@ -311,6 +340,14 @@ chain_reset() { # <table> <chain>: create it, or empty it in place
   fi
 }
 
+chain_reset6() { # <table> <chain>: create it, or empty it in place
+  if ! "$IP6TABLES_BIN" -t "$1" -L "$2" >/dev/null 2>&1; then
+    "$IP6TABLES_BIN" -t "$1" -N "$2"
+  else
+    "$IP6TABLES_BIN" -t "$1" -F "$2"
+  fi
+}
+
 chain_drop() { # <table> <chain>: remove a chain this script created, if present
   if "$IPTABLES_BIN" -t "$1" -L "$2" >/dev/null 2>&1; then
     "$IPTABLES_BIN" -t "$1" -F "$2"
@@ -385,8 +422,12 @@ flush_rules() {
     delete_rule_if_present filter "$chain" -i "$INTERFACE" -p udp --dport "$TOR_DNS_PORT" -j ACCEPT
   done
 
-  log "Removing the DNS guard"
-  dns_guard_flush
+  # The redirect goes, the resolver boundary stays: FTL still listens on :53
+  # under listeningMode=ALL, so removing the guard would publish DNS on the
+  # LAN. Re-install it instead, so a flush from an unguarded ruleset - or from
+  # one the operator half-removed by hand - closes rather than opens.
+  log "Keeping the DNS guard: FTL is still listening on :${PIHOLE_PORT} in ALL mode (re-installing it if missing)"
+  dns_guard_apply
 
   log "Cleaning ACCEPT rules"
   delete_rule_if_present filter INPUT -i "$INTERFACE" -s "$SUBNET" -j ACCEPT
@@ -464,7 +505,17 @@ case "$ACTION" in
     validate_protected_hosts
     refuse_unprotected_gateway
     [[ -n "$IPTABLES_BIN" ]] || IPTABLES_BIN="$(resolve_iptables)"
+    [[ -n "$IP6TABLES_BIN" ]] || IP6TABLES_BIN="$(resolve_ip6tables)"
     apply_rules
+    ;;
+  guard)
+    # The resolver boundary alone, run by systemd/pi-tor-guard.service before
+    # docker starts any container: FTL must never bind :53 unguarded, and a
+    # compose comment or the ui's own startup apply is already too late.
+    [[ -n "$IPTABLES_BIN" ]] || IPTABLES_BIN="$(resolve_iptables)"
+    [[ -n "$IP6TABLES_BIN" ]] || IP6TABLES_BIN="$(resolve_ip6tables)"
+    require_root
+    dns_guard_apply
     ;;
   apply-ap)
     [[ -n "$IPTABLES_BIN" ]] || IPTABLES_BIN="$(resolve_iptables)"
@@ -477,6 +528,7 @@ case "$ACTION" in
     ;;
   flush)
     [[ -n "$IPTABLES_BIN" ]] || IPTABLES_BIN="$(resolve_iptables)"
+    [[ -n "$IP6TABLES_BIN" ]] || IP6TABLES_BIN="$(resolve_ip6tables)"
     flush_rules
     ;;
   show-rules)
@@ -484,7 +536,7 @@ case "$ACTION" in
     show_rules
     ;;
   *)
-    echo "Usage: $0 [apply|flush|apply-ap|flush-ap|show-rules]" >&2
+    echo "Usage: $0 [apply|guard|flush|apply-ap|flush-ap|show-rules]" >&2
     exit 64
     ;;
 esac

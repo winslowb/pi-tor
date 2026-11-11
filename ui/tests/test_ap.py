@@ -661,9 +661,11 @@ class ApRulesTest(unittest.TestCase):
         self.assertEqual(hooks[2], "-i uap0 -j PI_TOR_AP_IN")
         # nothing is forwarded from the guest link
         self.assertEqual(self.fx.chain("filter", "FORWARD"), ["-i uap0 -j DROP"])
-        # IPv6: dropped in ip6tables as well
+        # IPv6: the DNS guard hooks come first, then the guest drop
         self.assertEqual(self.fx.chain("filter", "INPUT", self.fx.state6),
-                         ["-i uap0 -j DROP"])
+                         ["-p tcp --dport 53 -j PI_TOR_DNS",
+                          "-p udp --dport 53 -j PI_TOR_DNS",
+                          "-i uap0 -j DROP"])
         self.assertEqual(self.fx.chain("filter", "FORWARD", self.fx.state6),
                          ["-i uap0 -j DROP"])
 
@@ -707,8 +709,10 @@ class ApRulesTest(unittest.TestCase):
         self.assertEqual(hooks[2], "-i uap0 -j PI_TOR_AP_IN")
         self.assertIn("-i uap0 -j ACCEPT", hooks[3:], hooks)
         self.assertEqual(self.fx.chain("filter", "FORWARD")[0], "-i uap0 -j DROP")
-        self.assertEqual(self.fx.chain("filter", "INPUT", self.fx.state6)[0],
-                         "-i uap0 -j DROP")
+        hooks6 = self.fx.chain("filter", "INPUT", self.fx.state6)
+        self.assertEqual(sorted(hooks6[:2]), ["-p tcp --dport 53 -j PI_TOR_DNS",
+                                              "-p udp --dport 53 -j PI_TOR_DNS"])
+        self.assertEqual(hooks6[2], "-i uap0 -j DROP")
         self.assertEqual(self.fx.chain("filter", "FORWARD", self.fx.state6)[0],
                          "-i uap0 -j DROP")
         self.assertEqual(self.fx.chain("nat", "PREROUTING")[0],
@@ -765,8 +769,9 @@ class ApRulesTest(unittest.TestCase):
         # the tether's own INPUT rules survive too
         self.assertIn("-i usb0 -p udp ! --dport 53 -j DROP",
                       self.fx.chain("filter", "INPUT"))
-        # the ip6 chains stay (empty) or vanish; no DROP rule may survive
-        self.assertIn(self.fx.chain("filter", "INPUT", self.fx.state6), (None, []))
+        # no guest IPv6 DROP survives; the DNS guard may (it is not the AP's)
+        self.assertNotIn("-i uap0 -j DROP",
+                         self.fx.chain("filter", "INPUT", self.fx.state6) or [])
 
     def test_apply_ap_refuses_without_ip6tables(self):
         bash = shutil.which("bash")
@@ -775,7 +780,7 @@ class ApRulesTest(unittest.TestCase):
                              text=True, env=env, timeout=60)
         self.assertNotEqual(res.returncode, 0)
         self.assertIn("ip6tables", res.stderr)
-        self.assertIn("refusing to apply AP rules", res.stderr)
+        self.assertIn("refusing to apply", res.stderr)
         # refused before writing anything
         self.assertIsNone(self.fx.chain("nat", "PI_TOR_AP_REDIRECT"))
 

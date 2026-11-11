@@ -7,6 +7,7 @@ import unittest
 from pathlib import Path
 
 from helpers import REPO
+from test_startup import STUB as IPT_STUB
 
 RULES = REPO / "bin" / "pi-tor-rules.sh"
 
@@ -54,10 +55,24 @@ class UdpLeakPlugTest(unittest.TestCase):
         with tempfile.TemporaryDirectory(prefix="pi-tor-flush-") as d:
             stub = Path(d) / "iptables"
             log = Path(d) / "calls.log"
+            # every -C answers "no" (so nothing is ever deleted and no -D is
+            # issued) and everything else succeeds, because flush re-installs
+            # the guard on the way out
             stub.write_text("#!/bin/sh\nprintf '%s\\n' \"$*\" >> "
-                            + str(log) + "; exit 1\n")
+                            + str(log) + "\n\n"
+                            "for a in \"$@\"; do\n"
+                            "  case \"$a\" in -C|-D) exit 1 ;; esac\n"
+                            "done\nexit 0\n")
             os.chmod(stub, 0o755)
-            env = dict(os.environ, IPTABLES_BIN=str(stub), PI_TOR_FAKE_ROOT="1")
+            # flush re-installs the guard, so ip6tables has to answer: the
+            # simulator from test_startup, against its own state dir
+            stub6 = Path(d) / "ip6tables"
+            stub6.write_text(IPT_STUB)
+            os.chmod(stub6, 0o755)
+            state6 = str(Path(d) / "state6")
+            env = dict(os.environ, IPTABLES_BIN=str(stub),
+                       IP6TABLES_BIN=str(stub6), PI_TOR_FAKE_ROOT="1",
+                       PI_TOR_FAKE_STATE=state6, PI_TOR_FAKE_STATE6=state6)
             p = subprocess.run(["bash", str(RULES), "flush"], env=env,
                                capture_output=True, text=True, timeout=30)
             self.assertEqual(p.returncode, 0, p.stdout + p.stderr)

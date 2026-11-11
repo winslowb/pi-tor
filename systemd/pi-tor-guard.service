@@ -1,0 +1,24 @@
+[Unit]
+Description=pi-tor DNS guard (confine Pi-hole :53 before FTL can bind it)
+Documentation=https://github.com/winslowb/pi-tor#why-all-plus-a-firewall-guard-not-single
+# Pi-hole runs with listeningMode=ALL (docker-compose.yml), so FTL answers
+# whatever reaches :53 on every interface, IPv4 and IPv6, until netfilter's
+# guard exists. That has to happen before docker starts any container: the ui
+# container's own startup apply runs only once pihole is already up, which is
+# too late for the window this unit closes. docker restarts keep the rules
+# (they live in the kernel, in chains docker does not own), so one boot-time
+# run covers them.
+After=local-fs.target
+Before=docker.service pi-tor-stack.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+EnvironmentFile=-/etc/default/pi-tor
+# literal absolute path: systemd cannot expand a variable into one
+# Fails closed: with no ip6tables the script refuses to run, this unit fails,
+# and docker never starts an unguarded FTL.
+ExecStart=/opt/pi-tor/bin/pi-tor-rules.sh guard
+
+[Install]
+WantedBy=multi-user.target

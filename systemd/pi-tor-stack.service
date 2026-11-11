@@ -1,9 +1,12 @@
 [Unit]
 Description=pi-tor-pihole docker compose stack
-After=docker.service pi-tor-gadget.service
+After=docker.service pi-tor-gadget.service pi-tor-guard.service
 # starting the stack starts the gadget too; Wants (not Requires) keeps a
 # gadget failure from holding the stack back -- the UI then explains it
 Wants=pi-tor-gadget.service
+# the :53 guard must exist before docker starts pihole (listeningMode=ALL), so
+# a guard that cannot be installed fails this unit too: no unguarded resolver
+Requires=pi-tor-guard.service
 Requires=docker.service
 
 [Service]
